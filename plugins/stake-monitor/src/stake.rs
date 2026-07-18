@@ -456,13 +456,7 @@ pub fn render_report(entries: &[Entry], epoch: &EpochInfo) -> String {
 
     let total: u64 = entries
         .iter()
-        .map(|e| {
-            e.state
-                .delegation
-                .as_ref()
-                .map(|d| d.stake_lamports)
-                .unwrap_or(0)
-        })
+        .map(|e| e.state.delegation.as_ref().map_or(0, |d| d.stake_lamports))
         .sum();
     let delinquent = entries
         .iter()
@@ -491,8 +485,7 @@ pub fn render_report(entries: &[Entry], epoch: &EpochInfo) -> String {
                 e.state
                     .delegation
                     .as_ref()
-                    .map(|d| d.stake_lamports)
-                    .unwrap_or(e.state.lamports)
+                    .map_or(e.state.lamports, |d| d.stake_lamports)
             )
         )];
         if let Some(d) = &e.state.delegation {
