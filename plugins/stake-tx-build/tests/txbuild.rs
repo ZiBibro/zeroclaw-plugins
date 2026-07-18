@@ -1,0 +1,685 @@
+use std::collections::HashMap;
+
+use base64::Engine;
+use serde_json::Value;
+use stake_tx_build::txbuild::{
+    build_transaction, compile_message, deactivate_instruction, decode_compact_u16, decode_pubkey,
+    delegate_stake_instruction, encode_compact_u16, latest_blockhash_body, nonce_account_body,
+    parse_action, parse_latest_blockhash, parse_nonce_blockhash, serialize_message,
+    serialize_transaction, validate_vote, Action, Config, StakeAccountRef, STAKE_CONFIG_ID,
+    STAKE_PROGRAM_ID, SYSTEM_PROGRAM_ID, SYSVAR_CLOCK_ID, SYSVAR_RECENT_BLOCKHASHES_ID,
+    SYSVAR_STAKE_HISTORY_ID,
+};
+
+/// Raw mainnet getTransaction reply for delegate signature
+/// 5yaZiJMV... captured during Gate A pass 2 (see p2-stake-tx.md section 3).
+const MAINNET_DELEGATE: &str = include_str!("fixtures/mainnet_delegate_5yaZiJMV.json");
+
+// Pubkeys reused from the mainnet fixture so every constant is a real,
+// well-formed address.
+const AUTHORITY: &str = "FV2aEJiHpzPiLTSCDVkPcRC3zuycEbi4EBNJk8PhDFrk";
+const STAKE_ACC: &str = "2jmFsBxPomjikZaCcSN1SipxHsHaq8kfWZXdNtiQtV24";
+const VOTE_ACC: &str = "26pV97Ce83ZQ6Kz9XT4td8tdoUFPTng8Fb8gPyc53dJx";
+const OTHER_VOTE: &str = "GHViLh5MgQDGDsuwXTHM9r8kQqEnQY6WsyLvGVYbFXAA";
+const NONCE_ACC: &str = "CEHKNKfqQhHDWgiPrLNut2K3o5izJ1gpfSZ42CWBAv5n";
+const BLOCKHASH: &str = "AbhvM59j2SQDA8VxhTUYbFfE6QHY4M6rx9FVypA5cN7X";
+
+fn section(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+fn base_section() -> HashMap<String, String> {
+    section(&[
+        ("stake_accounts", &format!("main:{STAKE_ACC}")[..]),
+        ("authority", AUTHORITY),
+        ("rpc_url", "https://example-rpc.test"),
+        ("allowed_vote_accounts", VOTE_ACC),
+    ])
+}
+
+fn base_config() -> Config {
+    Config::from_section(&base_section()).expect("base section must parse")
+}
+
+fn durable_config() -> Config {
+    let mut s = base_section();
+    s.insert("nonce_account".to_string(), NONCE_ACC.to_string());
+    s.insert("nonce_authority".to_string(), AUTHORITY.to_string());
+    Config::from_section(&s).expect("durable section must parse")
+}
+
+fn blockhash_bytes() -> [u8; 32] {
+    decode_pubkey(BLOCKHASH).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Config: fail-closed behavior
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_parses_valid_section() {
+    let cfg = base_config();
+    assert_eq!(cfg.accounts.len(), 1);
+    assert_eq!(cfg.accounts[0].label, "main");
+    assert_eq!(cfg.authority, AUTHORITY);
+    assert_eq!(cfg.allowed_vote_accounts, vec![VOTE_ACC.to_string()]);
+    assert!(cfg.nonce.is_none());
+}
+
+#[test]
+fn config_rejects_unknown_key() {
+    let mut s = base_section();
+    s.insert("stake_acounts".to_string(), "x".to_string());
+    let err = Config::from_section(&s).unwrap_err();
+    assert!(
+        err.contains("unknown config key `stake_acounts`"),
+        "err: {err}"
+    );
+}
+
+#[test]
+fn config_requires_authority() {
+    let mut s = base_section();
+    s.remove("authority");
+    let err = Config::from_section(&s).unwrap_err();
+    assert!(err.contains("`authority` is required"), "err: {err}");
+}
+
+#[test]
+fn config_rejects_http_url() {
+    let mut s = base_section();
+    s.insert("rpc_url".to_string(), "http://insecure.test".to_string());
+    assert!(Config::from_section(&s).is_err());
+}
+
+#[test]
+fn config_rejects_half_a_nonce_pair() {
+    let mut s = base_section();
+    s.insert("nonce_account".to_string(), NONCE_ACC.to_string());
+    let err = Config::from_section(&s).unwrap_err();
+    assert!(err.contains("must be set together"), "err: {err}");
+
+    let mut s = base_section();
+    s.insert("nonce_authority".to_string(), AUTHORITY.to_string());
+    let err = Config::from_section(&s).unwrap_err();
+    assert!(err.contains("must be set together"), "err: {err}");
+}
+
+#[test]
+fn config_rejects_bad_vote_pubkey() {
+    let mut s = base_section();
+    s.insert(
+        "allowed_vote_accounts".to_string(),
+        "notbase58!".to_string(),
+    );
+    assert!(Config::from_section(&s).is_err());
+}
+
+#[test]
+fn config_rejects_out_of_range_timeout() {
+    for bad in ["0", "61"] {
+        let mut s = base_section();
+        s.insert("timeout_secs".to_string(), bad.to_string());
+        assert!(Config::from_section(&s).is_err(), "timeout {bad} must fail");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Argument validation and allowlist refusals
+// ---------------------------------------------------------------------------
+
+#[test]
+fn action_parses_and_rejects() {
+    assert_eq!(parse_action("delegate").unwrap(), Action::Delegate);
+    assert_eq!(parse_action("deactivate").unwrap(), Action::Deactivate);
+    let err = parse_action("withdraw").unwrap_err();
+    assert!(err.contains("`withdraw`"), "err: {err}");
+}
+
+#[test]
+fn stake_outside_allowlist_is_refused() {
+    let cfg = base_config();
+    let err = cfg.resolve_stake(OTHER_VOTE).unwrap_err();
+    assert!(
+        err.contains("not in the configured allowlist"),
+        "err: {err}"
+    );
+    assert!(err.contains("known labels: main"), "err: {err}");
+}
+
+#[test]
+fn stake_resolves_by_label_or_pubkey() {
+    let cfg = base_config();
+    assert_eq!(cfg.resolve_stake("main").unwrap().pubkey, STAKE_ACC);
+    assert_eq!(cfg.resolve_stake(STAKE_ACC).unwrap().label, "main");
+}
+
+#[test]
+fn vote_outside_allowlist_is_refused() {
+    let cfg = base_config();
+    let err = validate_vote(&cfg, Action::Delegate, Some(OTHER_VOTE)).unwrap_err();
+    assert!(
+        err.contains("not in the configured allowed_vote_accounts allowlist"),
+        "err: {err}"
+    );
+}
+
+#[test]
+fn delegate_without_vote_allowlist_is_disabled() {
+    let mut s = base_section();
+    s.remove("allowed_vote_accounts");
+    let cfg = Config::from_section(&s).expect("section without vote allowlist parses");
+    let err = validate_vote(&cfg, Action::Delegate, Some(VOTE_ACC)).unwrap_err();
+    assert!(err.contains("delegate is disabled"), "err: {err}");
+}
+
+#[test]
+fn delegate_requires_vote_argument() {
+    let cfg = base_config();
+    let err = validate_vote(&cfg, Action::Delegate, None).unwrap_err();
+    assert!(err.contains("requires a `vote_account`"), "err: {err}");
+}
+
+#[test]
+fn deactivate_rejects_vote_argument() {
+    let cfg = base_config();
+    let err = validate_vote(&cfg, Action::Deactivate, Some(VOTE_ACC)).unwrap_err();
+    assert!(err.contains("only valid for the delegate"), "err: {err}");
+    assert_eq!(validate_vote(&cfg, Action::Deactivate, None).unwrap(), None);
+}
+
+// ---------------------------------------------------------------------------
+// compact-u16 boundaries
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compact_u16_boundary_values() {
+    // Boundary encodings per the ShortU16 spec quoted in p2-stake-tx.md
+    // section 4: 7 payload bits per byte, continuation bit on top.
+    let cases: [(u16, &[u8]); 6] = [
+        (0, &[0x00]),
+        (127, &[0x7f]),
+        (128, &[0x80, 0x01]),
+        (16383, &[0xff, 0x7f]),
+        (16384, &[0x80, 0x80, 0x01]),
+        (u16::MAX, &[0xff, 0xff, 0x03]),
+    ];
+    for (value, expected) in cases {
+        assert_eq!(encode_compact_u16(value), expected, "encode {value}");
+        assert_eq!(
+            decode_compact_u16(expected).expect("boundary value must decode"),
+            (value, expected.len()),
+            "decode {value}"
+        );
+    }
+}
+
+#[test]
+fn compact_u16_rejects_overflow() {
+    // A third byte with more than 2 payload bits would overflow the u16.
+    assert!(decode_compact_u16(&[0x80, 0x80, 0x04]).is_none());
+    assert!(decode_compact_u16(&[0x80, 0x80, 0x80, 0x01]).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// RPC bodies and blockhash parsing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn request_bodies_carry_expected_fields() {
+    assert!(latest_blockhash_body().contains("getLatestBlockhash"));
+    let body = nonce_account_body(NONCE_ACC);
+    assert!(body.contains("getAccountInfo"));
+    assert!(body.contains(NONCE_ACC));
+    assert!(body.contains("base64"));
+}
+
+#[test]
+fn latest_blockhash_parses_live_shape() {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":433728871}},"value":{{"blockhash":"{BLOCKHASH}","lastValidBlockHeight":411790000}}}},"id":1}}"#
+    );
+    assert_eq!(parse_latest_blockhash(&body).unwrap(), blockhash_bytes());
+}
+
+fn nonce_body_with_hash(hash: &[u8; 32], owner: &str) -> String {
+    // Nonce state layout: 4-byte version tag, 4-byte state tag, 32-byte
+    // authority, then the durable blockhash at offset 40 (design.md,
+    // durable nonce section).
+    let mut data = vec![0u8; 80];
+    data[40..72].copy_from_slice(hash);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+    format!(
+        r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":{{"lamports":1447680,"owner":"{owner}","data":["{b64}","base64"],"executable":false,"rentEpoch":0,"space":80}}}},"id":1}}"#
+    )
+}
+
+#[test]
+fn nonce_blockhash_reads_offset_40_to_72() {
+    let expected: [u8; 32] = core::array::from_fn(|i| (i as u8) + 40);
+    let body = nonce_body_with_hash(&expected, SYSTEM_PROGRAM_ID);
+    assert_eq!(parse_nonce_blockhash(&body).unwrap(), expected);
+}
+
+#[test]
+fn nonce_blockhash_rejects_foreign_owner() {
+    let hash = [7u8; 32];
+    let body = nonce_body_with_hash(&hash, STAKE_PROGRAM_ID);
+    let err = parse_nonce_blockhash(&body).unwrap_err();
+    assert!(err.contains("expected the System program"), "err: {err}");
+}
+
+#[test]
+fn nonce_blockhash_rejects_short_data() {
+    let b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 40]);
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":{{"lamports":1,"owner":"{SYSTEM_PROGRAM_ID}","data":["{b64}","base64"],"executable":false,"rentEpoch":0,"space":40}}}},"id":1}}"#
+    );
+    assert!(parse_nonce_blockhash(&body).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Golden test against the real mainnet delegate transaction
+// ---------------------------------------------------------------------------
+
+struct MainnetDelegate {
+    account_keys: Vec<String>,
+    instruction_pubkeys: Vec<String>,
+    program_id: String,
+    data_bytes: Vec<u8>,
+}
+
+fn mainnet_delegate() -> MainnetDelegate {
+    let root: Value = serde_json::from_str(MAINNET_DELEGATE).expect("fixture is JSON");
+    let message = &root["result"]["transaction"]["message"];
+    let account_keys: Vec<String> = message["accountKeys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().unwrap().to_string())
+        .collect();
+    let ix = message["instructions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ix| ix["data"] == "3xyZh")
+        .expect("fixture holds the delegate instruction");
+    let instruction_pubkeys: Vec<String> = ix["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| account_keys[i.as_u64().unwrap() as usize].clone())
+        .collect();
+    let program_id = account_keys[ix["programIdIndex"].as_u64().unwrap() as usize].clone();
+    let data_bytes = bs58::decode(ix["data"].as_str().unwrap())
+        .into_vec()
+        .expect("instruction data is base58");
+    MainnetDelegate {
+        account_keys,
+        instruction_pubkeys,
+        program_id,
+        data_bytes,
+    }
+}
+
+#[test]
+fn golden_delegate_matches_mainnet_instruction_bytes() {
+    let fixture = mainnet_delegate();
+    assert_eq!(fixture.program_id, STAKE_PROGRAM_ID);
+    // u32 LE discriminant 2 (p2-stake-tx.md section 1), byte for byte.
+    assert_eq!(fixture.data_bytes, vec![2u8, 0, 0, 0]);
+
+    // Rebuild the instruction from the same stake account, authority, and
+    // vote account the mainnet transaction used.
+    let ours = delegate_stake_instruction(
+        decode_pubkey(&fixture.account_keys[1]).unwrap(),
+        decode_pubkey(&fixture.account_keys[0]).unwrap(),
+        decode_pubkey(&fixture.account_keys[6]).unwrap(),
+    );
+    assert_eq!(ours.program_id, decode_pubkey(STAKE_PROGRAM_ID).unwrap());
+    assert_eq!(ours.data, fixture.data_bytes);
+
+    // Account order must match the mainnet instruction position by position.
+    assert_eq!(ours.accounts.len(), fixture.instruction_pubkeys.len());
+    for (meta, expected) in ours.accounts.iter().zip(&fixture.instruction_pubkeys) {
+        assert_eq!(meta.pubkey, decode_pubkey(expected).unwrap());
+    }
+
+    // The sysvar constants must equal the addresses the live transaction
+    // referenced at the same instruction positions.
+    assert_eq!(fixture.instruction_pubkeys[2], SYSVAR_CLOCK_ID);
+    assert_eq!(fixture.instruction_pubkeys[3], SYSVAR_STAKE_HISTORY_ID);
+    assert_eq!(fixture.instruction_pubkeys[4], STAKE_CONFIG_ID);
+
+    // Flags: stake writable non-signer, then four read-only non-signers,
+    // authority read-only signer (p2-stake-tx.md section 1 table).
+    assert!(ours.accounts[0].is_writable && !ours.accounts[0].is_signer);
+    for meta in &ours.accounts[1..5] {
+        assert!(!meta.is_writable && !meta.is_signer);
+    }
+    assert!(ours.accounts[5].is_signer && !ours.accounts[5].is_writable);
+}
+
+#[test]
+fn golden_delegate_message_normalized_against_mainnet() {
+    // The mainnet transaction carries four instructions (compute budget,
+    // account creation, initialize, delegate), so its key table and full
+    // message bytes cannot equal ours, which holds the single delegate
+    // instruction. The comparison is therefore normalized: every compiled
+    // account index must resolve to the same pubkey on both sides, and the
+    // instruction data must match byte for byte.
+    let fixture = mainnet_delegate();
+    let stake = decode_pubkey(&fixture.account_keys[1]).unwrap();
+    let authority = decode_pubkey(&fixture.account_keys[0]).unwrap();
+    let vote = decode_pubkey(&fixture.account_keys[6]).unwrap();
+
+    let root: Value = serde_json::from_str(MAINNET_DELEGATE).unwrap();
+    let fixture_blockhash = decode_pubkey(
+        root["result"]["transaction"]["message"]["recentBlockhash"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let ix = delegate_stake_instruction(stake, authority, vote);
+    let msg = compile_message(authority, &[ix], fixture_blockhash).unwrap();
+
+    // Header: one writable signer (the fee payer), no read-only signers,
+    // and five read-only non-signers (vote, three sysvar-style accounts,
+    // the stake program id).
+    assert_eq!(msg.num_required_signatures, 1);
+    assert_eq!(msg.num_readonly_signed, 0);
+    assert_eq!(msg.num_readonly_unsigned, 5);
+    assert_eq!(msg.account_keys.len(), 7);
+    assert_eq!(msg.account_keys[0], authority, "fee payer must come first");
+
+    let compiled = &msg.instructions[0];
+    assert_eq!(compiled.data, fixture.data_bytes);
+    for (our_index, expected) in compiled
+        .account_indices
+        .iter()
+        .zip(&fixture.instruction_pubkeys)
+    {
+        assert_eq!(
+            msg.account_keys[*our_index as usize],
+            decode_pubkey(expected).unwrap(),
+            "normalized account mismatch"
+        );
+    }
+    assert_eq!(
+        msg.account_keys[compiled.program_id_index as usize],
+        decode_pubkey(STAKE_PROGRAM_ID).unwrap()
+    );
+    assert_eq!(msg.recent_blockhash, fixture_blockhash);
+}
+
+// ---------------------------------------------------------------------------
+// Built transactions: structure, durability, round trip
+// ---------------------------------------------------------------------------
+
+/// Minimal wire-format reader for assertions, following the transaction
+/// layout in p2-stake-tx.md section 4.
+struct DecodedTx {
+    signature_count: u16,
+    signatures: Vec<u8>,
+    header: [u8; 3],
+    account_keys: Vec<[u8; 32]>,
+    recent_blockhash: [u8; 32],
+    instructions: Vec<(u8, Vec<u8>, Vec<u8>)>,
+}
+
+fn decode_tx(bytes: &[u8]) -> DecodedTx {
+    let (signature_count, mut pos) = decode_compact_u16(bytes).unwrap();
+    let signatures = bytes[pos..pos + 64 * signature_count as usize].to_vec();
+    pos += 64 * signature_count as usize;
+    let header: [u8; 3] = bytes[pos..pos + 3].try_into().unwrap();
+    pos += 3;
+    let (key_count, used) = decode_compact_u16(&bytes[pos..]).unwrap();
+    pos += used;
+    let mut account_keys = Vec::new();
+    for _ in 0..key_count {
+        account_keys.push(<[u8; 32]>::try_from(&bytes[pos..pos + 32]).unwrap());
+        pos += 32;
+    }
+    let recent_blockhash: [u8; 32] = bytes[pos..pos + 32].try_into().unwrap();
+    pos += 32;
+    let (ix_count, used) = decode_compact_u16(&bytes[pos..]).unwrap();
+    pos += used;
+    let mut instructions = Vec::new();
+    for _ in 0..ix_count {
+        let program_id_index = bytes[pos];
+        pos += 1;
+        let (acc_count, used) = decode_compact_u16(&bytes[pos..]).unwrap();
+        pos += used;
+        let indices = bytes[pos..pos + acc_count as usize].to_vec();
+        pos += acc_count as usize;
+        let (data_len, used) = decode_compact_u16(&bytes[pos..]).unwrap();
+        pos += used;
+        let data = bytes[pos..pos + data_len as usize].to_vec();
+        pos += data_len as usize;
+        instructions.push((program_id_index, indices, data));
+    }
+    assert_eq!(pos, bytes.len(), "trailing bytes after the message");
+    DecodedTx {
+        signature_count,
+        signatures,
+        header,
+        account_keys,
+        recent_blockhash,
+        instructions,
+    }
+}
+
+#[test]
+fn deactivate_builds_expected_wire_transaction() {
+    let cfg = base_config();
+    let stake = cfg.resolve_stake("main").unwrap();
+    let built =
+        build_transaction(&cfg, Action::Deactivate, stake, None, blockhash_bytes()).unwrap();
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&built.tx_base64)
+        .expect("output must be valid base64");
+    let tx = decode_tx(&bytes);
+
+    // Unsigned form: the signature count equals numRequiredSignatures and
+    // every slot is a 64-byte zero placeholder.
+    assert_eq!(tx.signature_count, 1);
+    assert!(tx.signatures.iter().all(|b| *b == 0));
+    assert_eq!(tx.header, [1, 0, 2]);
+    // Keys: authority (fee payer), stake, then clock sysvar and the stake
+    // program in the read-only tail.
+    assert_eq!(tx.account_keys.len(), 4);
+    assert_eq!(tx.account_keys[0], decode_pubkey(AUTHORITY).unwrap());
+    assert_eq!(tx.account_keys[1], decode_pubkey(STAKE_ACC).unwrap());
+    assert_eq!(tx.recent_blockhash, blockhash_bytes());
+
+    // One Deactivate instruction: u32 LE discriminant 5, accounts stake,
+    // clock, authority (p2-stake-tx.md section 1).
+    assert_eq!(tx.instructions.len(), 1);
+    let (program_index, indices, data) = &tx.instructions[0];
+    assert_eq!(
+        tx.account_keys[*program_index as usize],
+        decode_pubkey(STAKE_PROGRAM_ID).unwrap()
+    );
+    assert_eq!(*data, vec![5u8, 0, 0, 0]);
+    let resolved: Vec<[u8; 32]> = indices
+        .iter()
+        .map(|i| tx.account_keys[*i as usize])
+        .collect();
+    assert_eq!(resolved[0], decode_pubkey(STAKE_ACC).unwrap());
+    assert_eq!(resolved[1], decode_pubkey(SYSVAR_CLOCK_ID).unwrap());
+    assert_eq!(resolved[2], decode_pubkey(AUTHORITY).unwrap());
+
+    // Summary line: action and label present, no invented amount, fresh
+    // blockhash warning present.
+    assert!(built.summary.contains("deactivate"), "{}", built.summary);
+    assert!(built.summary.contains("`main`"), "{}", built.summary);
+    assert!(
+        built.summary.contains("amount not read"),
+        "{}",
+        built.summary
+    );
+    assert!(
+        built.summary.contains("60 to 90 seconds"),
+        "{}",
+        built.summary
+    );
+    assert!(!built.summary.contains("SOL"), "{}", built.summary);
+    let output = built.output();
+    let mut lines = output.lines();
+    assert_eq!(lines.next(), Some(built.summary.as_str()));
+    assert_eq!(
+        lines.next(),
+        Some(format!("unsigned_tx_base64: {}", built.tx_base64).as_str())
+    );
+}
+
+#[test]
+fn delegate_builds_and_reports_voter() {
+    let cfg = base_config();
+    let stake = cfg.resolve_stake("main").unwrap();
+    let built = build_transaction(
+        &cfg,
+        Action::Delegate,
+        stake,
+        Some(VOTE_ACC),
+        blockhash_bytes(),
+    )
+    .unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&built.tx_base64)
+        .unwrap();
+    let tx = decode_tx(&bytes);
+    assert_eq!(tx.header, [1, 0, 5]);
+    let (_, _, data) = &tx.instructions[0];
+    assert_eq!(*data, vec![2u8, 0, 0, 0]);
+    assert!(built.summary.contains(VOTE_ACC), "{}", built.summary);
+}
+
+#[test]
+fn durable_variant_prepends_advance_nonce_and_uses_nonce_blockhash() {
+    let cfg = durable_config();
+    let stake = cfg.resolve_stake("main").unwrap();
+
+    // The durable blockhash comes out of the nonce account state, not the
+    // recent blockhash queue.
+    let nonce_hash: [u8; 32] = core::array::from_fn(|i| 0xA0u8.wrapping_add(i as u8));
+    let body = nonce_body_with_hash(&nonce_hash, SYSTEM_PROGRAM_ID);
+    let parsed_hash = parse_nonce_blockhash(&body).unwrap();
+    assert_eq!(parsed_hash, nonce_hash);
+
+    let built = build_transaction(&cfg, Action::Deactivate, stake, None, parsed_hash).unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&built.tx_base64)
+        .unwrap();
+    let tx = decode_tx(&bytes);
+
+    assert_eq!(tx.recent_blockhash, nonce_hash);
+    assert_eq!(tx.instructions.len(), 2);
+
+    // First instruction must be AdvanceNonceAccount: System program, u32 LE
+    // discriminant 4, accounts nonce, RecentBlockhashes sysvar, authority
+    // (p2-stake-tx.md section 2).
+    let (program_index, indices, data) = &tx.instructions[0];
+    assert_eq!(
+        tx.account_keys[*program_index as usize],
+        decode_pubkey(SYSTEM_PROGRAM_ID).unwrap()
+    );
+    assert_eq!(*data, vec![4u8, 0, 0, 0]);
+    let resolved: Vec<[u8; 32]> = indices
+        .iter()
+        .map(|i| tx.account_keys[*i as usize])
+        .collect();
+    assert_eq!(resolved[0], decode_pubkey(NONCE_ACC).unwrap());
+    assert_eq!(
+        resolved[1],
+        decode_pubkey(SYSVAR_RECENT_BLOCKHASHES_ID).unwrap()
+    );
+    assert_eq!(resolved[2], decode_pubkey(AUTHORITY).unwrap());
+
+    // The nonce account must land in the writable non-signer zone.
+    let num_signed = tx.header[0] as usize;
+    let writable_end = tx.account_keys.len() - tx.header[2] as usize;
+    let nonce_pos = tx
+        .account_keys
+        .iter()
+        .position(|k| *k == decode_pubkey(NONCE_ACC).unwrap())
+        .unwrap();
+    assert!(nonce_pos >= num_signed && nonce_pos < writable_end);
+
+    // The second instruction stays the plain Deactivate.
+    let (_, _, data) = &tx.instructions[1];
+    assert_eq!(*data, vec![5u8, 0, 0, 0]);
+
+    assert!(built.summary.contains("durable nonce"), "{}", built.summary);
+    assert!(
+        !built.summary.contains("60 to 90 seconds"),
+        "{}",
+        built.summary
+    );
+}
+
+#[test]
+fn base64_round_trips_and_message_bytes_match() {
+    let cfg = base_config();
+    let stake = cfg.resolve_stake("main").unwrap();
+    let built =
+        build_transaction(&cfg, Action::Deactivate, stake, None, blockhash_bytes()).unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&built.tx_base64)
+        .unwrap();
+    let reencoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    assert_eq!(reencoded, built.tx_base64);
+
+    // The transaction suffix must equal an independent serialization of the
+    // same message, byte for byte.
+    let authority = decode_pubkey(AUTHORITY).unwrap();
+    let ix = deactivate_instruction(decode_pubkey(STAKE_ACC).unwrap(), authority);
+    let msg = compile_message(authority, &[ix], blockhash_bytes()).unwrap();
+    let msg_bytes = serialize_message(&msg);
+    assert_eq!(&bytes[1 + 64..], &msg_bytes[..]);
+    assert_eq!(
+        serialize_transaction(msg.num_required_signatures, &msg_bytes),
+        bytes
+    );
+}
+
+#[test]
+fn compile_message_merges_duplicate_keys() {
+    // The authority appears as fee payer and as instruction signer; it must
+    // occupy a single slot with merged flags.
+    let authority = decode_pubkey(AUTHORITY).unwrap();
+    let ix = deactivate_instruction(decode_pubkey(STAKE_ACC).unwrap(), authority);
+    let msg = compile_message(authority, &[ix], blockhash_bytes()).unwrap();
+    let occurrences = msg.account_keys.iter().filter(|k| **k == authority).count();
+    assert_eq!(occurrences, 1);
+    assert_eq!(msg.num_required_signatures, 1);
+}
+
+#[test]
+fn build_transaction_end_to_end_via_refs() {
+    // Exercise the same call path the shim uses, with a stake ref taken
+    // straight from the config.
+    let cfg = durable_config();
+    let stake: &StakeAccountRef = cfg.resolve_stake(STAKE_ACC).unwrap();
+    let vote = validate_vote(&cfg, Action::Delegate, Some(VOTE_ACC)).unwrap();
+    let built = build_transaction(
+        &cfg,
+        Action::Delegate,
+        stake,
+        vote.as_deref(),
+        blockhash_bytes(),
+    )
+    .unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&built.tx_base64)
+        .unwrap();
+    let tx = decode_tx(&bytes);
+    assert_eq!(tx.instructions.len(), 2);
+    assert_eq!(tx.instructions[0].2, vec![4u8, 0, 0, 0]);
+    assert_eq!(tx.instructions[1].2, vec![2u8, 0, 0, 0]);
+}
