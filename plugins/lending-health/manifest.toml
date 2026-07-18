@@ -1,0 +1,12 @@
+name = "lending-health"
+version = "0.1.0"
+description = "DeFi lending position health for operator wallets: LTV vs liquidation across Kamino and MarginFi, shaped for chat"
+author = "ZiBibro"
+wasm_path = "lending_health.wasm"
+capabilities = ["tool"]
+# http_client: outbound HTTPS to the Kamino public API and to the operator's
+# own Solana RPC endpoint. No other hosts are contacted.
+# config_read: wallet allowlist, RPC URL, and alert thresholds live in this
+# plugin's jailed config section, injected as `__config`. The plugin refuses
+# to run without a configured wallet allowlist.
+permissions = ["http_client", "config_read"]
