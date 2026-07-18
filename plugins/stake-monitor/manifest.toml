@@ -1,0 +1,11 @@
+name = "stake-monitor"
+version = "0.1.0"
+description = "Status, validator delinquency, and epoch rewards for the operator's own stake accounts, shaped for chat"
+author = "ZiBibro"
+wasm_path = "stake_monitor.wasm"
+capabilities = ["tool"]
+# http_client: outbound HTTPS to the operator's own Solana RPC endpoint only.
+# config_read: the stake account allowlist and RPC URL live in this plugin's
+# jailed config section, injected as `__config`. The plugin refuses to run
+# without a configured allowlist.
+permissions = ["http_client", "config_read"]
