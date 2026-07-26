@@ -4,12 +4,13 @@
 //! Offsets derive from the marginfi-v2 type crate (commit d4c70c8) and were
 //! sanity-checked on 2026-07-18 by decoding a live mainnet account and
 //! cross-checking the group and authority fields against a second RPC read.
-//! The account fixture under `tests/fixtures/` is that live capture.
+//! `tests/fixtures/marginfi_gpa_response.json` is that live capture; the
+//! `_maint_synthetic` fixture beside it is hand-built, not captured.
 
 use base64::Engine;
 use serde_json::Value;
 
-use crate::health::{Position, Protocol};
+use crate::health::{short_account, Liquidation, Position, Protocol};
 
 pub const MARGINFI_PROGRAM: &str = "MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA";
 
@@ -27,7 +28,12 @@ const OFFSET_ASSET_VALUE_MAINT: usize = 1872;
 const OFFSET_LIABILITY_VALUE_MAINT: usize = 1888;
 const OFFSET_FLAGS: usize = 1944;
 
+/// The risk engine's own verdict on the account.
 const FLAG_HEALTHY: u32 = 1;
+/// Set when the engine's last risk check ran through, so the rest of the
+/// cache and the verdict above it were written by that run.
+const FLAG_ENGINE_STATUS_OK: u32 = 2;
+/// Set when every oracle the account depends on priced within its age limit.
 const FLAG_ORACLE_OK: u32 = 4;
 
 /// JSON-RPC body for `getProgramAccounts` filtered down to the marginfi
@@ -106,48 +112,60 @@ pub fn decode_account(data: &[u8], pubkey: &str, wallet_label: &str) -> Option<P
     }
 
     let healthy = flags & FLAG_HEALTHY != 0;
+    let engine_ok = flags & FLAG_ENGINE_STATUS_OK != 0;
     let oracle_ok = flags & FLAG_ORACLE_OK != 0;
 
+    // A cleared HEALTHY bit only condemns when the engine is the one who
+    // cleared it. With ENGINE_STATUS_OK unset the cache holds whatever stood
+    // there before the last check, down to the all-zero word an account
+    // carries before its first check ever runs, and a bit nobody set is the
+    // absence of a verdict rather than a bad one.
+    let condemned = engine_ok && !healthy;
+
     // Liquidation begins when maintenance-weighted liabilities reach
-    // maintenance-weighted assets, so that ratio maps onto the LTV scale
-    // with the liquidation threshold at 1.0. When the oracle flag is unset
-    // the maintenance pair can be zeroed by the risk engine; falling back to
-    // the initial-weight pair avoids a false liquidation alarm, and the hint
-    // says which basis the number is on.
-    let maint_usable = asset_maint > 0.0 || (oracle_ok && liability_maint == 0.0);
-    let (mut ltv, stale_hint) = if maint_usable {
-        let ratio = if asset_maint > 0.0 {
-            liability_maint / asset_maint
-        } else {
-            0.0
-        };
-        let hint = (!oracle_ok).then(|| "oracle flag unset".to_string());
-        (ratio, hint)
-    } else {
-        let ratio = if asset > 0.0 {
-            liability / asset
-        } else if liability > 0.0 {
-            1.0
-        } else {
-            0.0
-        };
+    // maintenance-weighted assets, so that ratio maps onto the LTV scale with
+    // the liquidation threshold at 1.0. The risk engine zeroes the maintenance
+    // pair when it cannot price the account, and the initial-weight pair sits
+    // on a different basis against a different line: it cannot stand in. Such
+    // an account is reported with the values it does carry and no liquidation
+    // distance at all, marked so the operator knows why the distance is gone.
+    // The verdict travels beside the ratio instead of inside it: whatever the
+    // maintenance pair measures is what gets printed, and `flagged_unhealthy`
+    // carries the condemnation, which needs no basis to be believed.
+    let (liquidation, stale_hint) = if !engine_ok {
+        (None, Some("engine status unset".to_string()))
+    } else if asset_maint > 0.0 {
+        let mut hints: Vec<&str> = Vec::new();
+        if !oracle_ok {
+            hints.push("oracle flag unset");
+        }
+        if condemned {
+            hints.push("flagged unhealthy");
+        }
         (
-            ratio,
-            Some("oracle flag unset; init-weight ratio".to_string()),
+            Some(Liquidation {
+                ltv: liability_maint / asset_maint,
+                liquidation_ltv: 1.0,
+            }),
+            (!hints.is_empty()).then(|| hints.join("; ")),
         )
+    } else {
+        let mut hint = "maint basis unavailable".to_string();
+        if condemned {
+            hint.push_str("; flagged unhealthy");
+        }
+        (None, Some(hint))
     };
-    if !healthy {
-        ltv = ltv.max(1.0);
-    }
 
     Some(Position {
         wallet_label: wallet_label.to_string(),
         protocol: Protocol::Marginfi,
-        market: format!("acct@{}", pubkey.chars().take(4).collect::<String>()),
+        market: "acct".to_string(),
+        account: short_account(pubkey),
         deposit_usd: asset,
         borrow_usd: liability,
-        ltv,
-        liquidation_ltv: 1.0,
+        liquidation,
+        flagged_unhealthy: condemned,
         stale_hint,
     })
 }

@@ -7,24 +7,55 @@
 //! 2026-07-18: `getEpochInfo`, `getVoteAccounts` (with the `votePubkey`
 //! filter), `getAccountInfo` (jsonParsed), and `getInflationReward`.
 //! Numeric delegation fields arrive as decimal strings; an active stake has
-//! `deactivationEpoch` equal to u64::MAX rendered as a string.
+//! `deactivationEpoch` equal to u64::MAX rendered as a string. Vote lag and
+//! epoch progress are derived from fields those same replies already carry,
+//! so neither reading costs an extra call.
 
 use std::collections::HashMap;
 
 use serde_json::Value;
 
-/// Hard cap for the rendered report, in characters. Keeps the tool output
-/// around 200 tokens so a scheduled briefing never floods the agent context.
+/// Hard cap for the delivered payload, in characters: the rendered report and
+/// the data-issues line together. Keeps the tool output around 200 tokens so a
+/// scheduled briefing never floods the agent context.
 pub const REPORT_CHAR_CAP: usize = 900;
+
+/// Share of [`REPORT_CHAR_CAP`] the data-issues line may claim. The account
+/// rows are what the briefing is for, so a run that collected a long list of
+/// failed reads still leaves two thirds of the payload to them.
+const ISSUE_CHAR_BUDGET: usize = REPORT_CHAR_CAP / 3;
+
+const ISSUE_PREFIX: &str = "\nData issues: ";
+
+const ISSUE_SEPARATOR: &str = "; ";
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
-const CONFIG_KEYS: [&str; 3] = ["stake_accounts", "rpc_url", "timeout_secs"];
+const CONFIG_KEYS: [&str; 4] = [
+    "stake_accounts",
+    "rpc_url",
+    "vote_lag_warn_slots",
+    "timeout_secs",
+];
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
 /// Average slot time used only for the human "epoch ends in ~N h" hint.
 const SECONDS_PER_SLOT: f64 = 0.4;
+
+/// Slots behind the chain tip at which `getVoteAccounts` already reports a
+/// vote account as delinquent: the `delinquentSlotDistance` default the RPC
+/// applies when the call leaves that parameter out. A warn threshold above it
+/// could only fire after the verdict it is meant to precede, so it is the
+/// upper bound for `vote_lag_warn_slots`.
+pub const DELINQUENT_SLOT_DISTANCE: u64 = 128;
+
+/// Default vote lag, in slots, past which a still-voting validator is called
+/// out as drifting. A quarter of [`DELINQUENT_SLOT_DISTANCE`] is roughly 13
+/// seconds of missed voting: early enough to act on, and far enough above
+/// normal jitter to stay quiet on a healthy node. Operators who want a
+/// different balance set the `vote_lag_warn_slots` config key.
+pub const DEFAULT_VOTE_LAG_WARN_SLOTS: u64 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StakeAccountRef {
@@ -36,6 +67,7 @@ pub struct StakeAccountRef {
 pub struct Config {
     pub accounts: Vec<StakeAccountRef>,
     pub rpc_url: String,
+    pub vote_lag_warn_slots: u64,
     pub timeout_secs: u64,
 }
 
@@ -66,6 +98,18 @@ impl Config {
             return Err(format!("rpc_url must be an https:// URL, got `{rpc_url}`"));
         }
 
+        let vote_lag_warn_slots = match section.get("vote_lag_warn_slots") {
+            Some(raw) => raw.trim().parse::<u64>().map_err(|_| {
+                format!("vote_lag_warn_slots must be a positive integer, got `{raw}`")
+            })?,
+            None => DEFAULT_VOTE_LAG_WARN_SLOTS,
+        };
+        if vote_lag_warn_slots == 0 || vote_lag_warn_slots > DELINQUENT_SLOT_DISTANCE {
+            return Err(format!(
+                "vote_lag_warn_slots must be between 1 and {DELINQUENT_SLOT_DISTANCE}, got {vote_lag_warn_slots}"
+            ));
+        }
+
         let timeout_secs = match section.get("timeout_secs") {
             Some(raw) => raw
                 .trim()
@@ -82,6 +126,7 @@ impl Config {
         Ok(Config {
             accounts,
             rpc_url,
+            vote_lag_warn_slots,
             timeout_secs,
         })
     }
@@ -208,35 +253,78 @@ fn rpc_result(body: &str) -> Result<Value, String> {
         .ok_or_else(|| "RPC reply has no result".to_string())
 }
 
+/// Slot counters that describe a real epoch. The fields are private and the
+/// only way in is [`EpochProgress::new`], so every reading below rests on the
+/// invariant it checks: a non-zero epoch length with an index inside it.
 #[derive(Debug, Clone, Copy)]
-pub struct EpochInfo {
-    pub epoch: u64,
-    pub slot_index: u64,
-    pub slots_in_epoch: u64,
+pub struct EpochProgress {
+    slot_index: u64,
+    slots_in_epoch: u64,
 }
 
-impl EpochInfo {
+impl EpochProgress {
+    /// `None` when the counters cannot describe an epoch: a zero-length one,
+    /// or an index past its end. Both would poison the progress figure and
+    /// the "hours left" hint, so they yield no reading at all.
+    pub fn new(slot_index: u64, slots_in_epoch: u64) -> Option<Self> {
+        if slots_in_epoch == 0 || slot_index > slots_in_epoch {
+            return None;
+        }
+        Some(EpochProgress {
+            slot_index,
+            slots_in_epoch,
+        })
+    }
+
     pub fn hours_to_end(&self) -> u64 {
-        let slots_left = self.slots_in_epoch.saturating_sub(self.slot_index);
+        let slots_left = self.slots_in_epoch - self.slot_index;
         (slots_left as f64 * SECONDS_PER_SLOT / 3600.0).round() as u64
+    }
+
+    /// How far the network has moved into the current epoch, in whole
+    /// percent. Widened to u128 so a hostile pair of counters cannot overflow
+    /// the multiplication; the constructor's invariant already caps the
+    /// result at 100.
+    pub fn pct(&self) -> u64 {
+        (self.slot_index as u128 * 100 / self.slots_in_epoch as u128) as u64
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EpochInfo {
+    pub epoch: u64,
+    /// Network head at the time of the reply, and the reference point for
+    /// every validator's vote lag. `None` when the reply carried no
+    /// `absoluteSlot`, in which case lag reads as unknown rather than being
+    /// measured against an invented head.
+    pub absolute_slot: Option<u64>,
+    /// `None` when the reply carried no usable slot counters, which costs the
+    /// progress figure and nothing else.
+    pub progress: Option<EpochProgress>,
+}
+
+/// Reads a `getEpochInfo` reply. Only the epoch number is load-bearing, since
+/// the delegation lifecycle is derived from it. The head slot and the slot
+/// counters degrade on their own: a reply missing `absoluteSlot`, or carrying
+/// counters that cannot describe a real epoch, costs the vote-lag reading and
+/// the progress figure while every other line of the report still renders.
 pub fn parse_epoch_info(body: &str) -> Result<EpochInfo, String> {
     let r = rpc_result(body)?;
+    let epoch = r
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .ok_or("epoch missing")?;
+    let progress = match (
+        r.get("slotIndex").and_then(Value::as_u64),
+        r.get("slotsInEpoch").and_then(Value::as_u64),
+    ) {
+        (Some(index), Some(len)) => EpochProgress::new(index, len),
+        _ => None,
+    };
     Ok(EpochInfo {
-        epoch: r
-            .get("epoch")
-            .and_then(Value::as_u64)
-            .ok_or("epoch missing")?,
-        slot_index: r
-            .get("slotIndex")
-            .and_then(Value::as_u64)
-            .ok_or("slotIndex missing")?,
-        slots_in_epoch: r
-            .get("slotsInEpoch")
-            .and_then(Value::as_u64)
-            .ok_or("slotsInEpoch missing")?,
+        epoch,
+        absolute_slot: r.get("absoluteSlot").and_then(Value::as_u64),
+        progress,
     })
 }
 
@@ -311,38 +399,83 @@ pub fn parse_stake_account(body: &str) -> Result<StakeState, String> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidatorStatus {
-    Ok { commission_bps: u64 },
-    Delinquent { commission_bps: u64 },
+    Ok {
+        commission_bps: u64,
+        last_vote_slot: Option<u64>,
+    },
+    Delinquent {
+        commission_bps: u64,
+        last_vote_slot: Option<u64>,
+    },
     Unknown,
+}
+
+impl ValidatorStatus {
+    /// Slots between the network head and this validator's last vote. `None`
+    /// when the epoch reply carried no head slot, when the vote record
+    /// carried no usable `lastVote`, or when the validator was not found at
+    /// all, so an unread number never renders as a healthy zero.
+    pub fn vote_lag(&self, absolute_slot: Option<u64>) -> Option<u64> {
+        let head = absolute_slot?;
+        match self {
+            ValidatorStatus::Ok { last_vote_slot, .. }
+            | ValidatorStatus::Delinquent { last_vote_slot, .. } => {
+                last_vote_slot.map(|slot| head.saturating_sub(slot))
+            }
+            ValidatorStatus::Unknown => None,
+        }
+    }
+
+    /// True when the validator still counts as current but its votes are
+    /// drifting past `warn_slots`, the operator's `vote_lag_warn_slots`. This
+    /// is the pre-delinquency signal; a validator the RPC already calls
+    /// delinquent is reported as delinquent and is not double-flagged here.
+    pub fn is_behind(&self, absolute_slot: Option<u64>, warn_slots: u64) -> bool {
+        matches!(self, ValidatorStatus::Ok { .. })
+            && self
+                .vote_lag(absolute_slot)
+                .is_some_and(|lag| lag > warn_slots)
+    }
 }
 
 /// Reads a `getVoteAccounts` reply that was filtered by `votePubkey`.
 /// Commission is taken from `inflationRewardsCommissionBps` when present,
 /// with the legacy percentage `commission` as the fallback, because the
-/// modern field is authoritative and the legacy one can lag.
+/// modern field is authoritative and the legacy one can lag. `lastVote` is
+/// kept for the vote-lag reading; the RPC reports `0` for a vote account
+/// that has never voted, which is an absent vote rather than a lag of the
+/// whole chain history, so it is read as unknown.
 pub fn parse_vote_status(body: &str, voter: &str) -> Result<ValidatorStatus, String> {
     let r = rpc_result(body)?;
-    let pick = |list: &str| -> Option<u64> {
+    let pick = |list: &str| -> Option<(u64, Option<u64>)> {
         r.get(list)?
             .as_array()?
             .iter()
             .find(|v| v.get("votePubkey").and_then(Value::as_str) == Some(voter))
             .map(|v| {
-                v.get("inflationRewardsCommissionBps")
+                let commission_bps = v
+                    .get("inflationRewardsCommissionBps")
                     .and_then(Value::as_u64)
                     .unwrap_or_else(|| {
                         v.get("commission").and_then(Value::as_u64).unwrap_or(0) * 100
-                    })
+                    });
+                let last_vote_slot = v
+                    .get("lastVote")
+                    .and_then(Value::as_u64)
+                    .filter(|slot| *slot > 0);
+                (commission_bps, last_vote_slot)
             })
     };
-    if let Some(bps) = pick("current") {
+    if let Some((commission_bps, last_vote_slot)) = pick("current") {
         return Ok(ValidatorStatus::Ok {
-            commission_bps: bps,
+            commission_bps,
+            last_vote_slot,
         });
     }
-    if let Some(bps) = pick("delinquent") {
+    if let Some((commission_bps, last_vote_slot)) = pick("delinquent") {
         return Ok(ValidatorStatus::Delinquent {
-            commission_bps: bps,
+            commission_bps,
+            last_vote_slot,
         });
     }
     Ok(ValidatorStatus::Unknown)
@@ -449,7 +582,111 @@ fn fmt_sol(lamports: u64) -> String {
     }
 }
 
-pub fn render_report(entries: &[Entry], epoch: &EpochInfo) -> String {
+/// One short vote-lag field. An unreadable `lastVote`, or an epoch reply that
+/// carried no head slot to measure against, prints `unknown` instead of a
+/// fabricated slot count.
+fn fmt_vote_lag(validator: &ValidatorStatus, epoch: &EpochInfo, warn_slots: u64) -> String {
+    match validator.vote_lag(epoch.absolute_slot) {
+        Some(lag) if validator.is_behind(epoch.absolute_slot, warn_slots) => {
+            format!("vote lag {lag} slot(s) BEHIND")
+        }
+        Some(lag) => format!("vote lag {lag} slot(s)"),
+        None => "vote lag unknown".to_string(),
+    }
+}
+
+/// The payload the tool delivers: the report, plus one trailing line naming
+/// the reads that failed. The suffix is measured before the rows are rendered
+/// and its room comes out of the rendering budget, so [`REPORT_CHAR_CAP`]
+/// bounds everything the agent receives instead of only the part above the
+/// suffix. The suffix itself never claims more than [`ISSUE_CHAR_BUDGET`], so
+/// a run where every account failed still delivers a readable report.
+pub fn render_payload(
+    entries: &[Entry],
+    epoch: &EpochInfo,
+    cfg: &Config,
+    issues: &[String],
+) -> String {
+    let suffix = render_issues(issues);
+    let report = render_within(
+        entries,
+        epoch,
+        cfg,
+        REPORT_CHAR_CAP.saturating_sub(suffix.len()),
+    );
+    format!("{report}{suffix}")
+}
+
+/// Renders the error text for a run where every stake account read failed. The
+/// failure path carries server-controlled strings too, so it is bounded by the
+/// same budget as the success path rather than pasting every upstream message
+/// into the agent context.
+pub fn render_total_failure(issues: &[String]) -> String {
+    let listed = render_issues(issues);
+    // `render_issues` opens with a newline and its own label; the failure text
+    // reads as one line, so both are stripped here.
+    let detail = listed
+        .trim_start_matches('\n')
+        .trim_start_matches("Data issues: ");
+    format!("every stake account read failed: {detail}")
+}
+
+/// One line naming the reads that failed, empty when the run hit no trouble.
+/// Issues past the budget are counted rather than spelled out, so a pile of
+/// long RPC errors cannot push the payload past the cap.
+fn render_issues(issues: &[String]) -> String {
+    if issues.is_empty() {
+        return String::new();
+    }
+    // No issue is dropped for free: whatever the budget pushes out is counted
+    // in a marker whose room is reserved up front, at the widest count it
+    // could carry.
+    let reserve = ISSUE_SEPARATOR.len() + omitted_issues(issues.len()).len();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = ISSUE_PREFIX.len();
+    for issue in issues {
+        let cost = issue.len()
+            + if kept.is_empty() {
+                0
+            } else {
+                ISSUE_SEPARATOR.len()
+            };
+        if used + cost > ISSUE_CHAR_BUDGET.saturating_sub(reserve) {
+            break;
+        }
+        used += cost;
+        kept.push(issue.as_str());
+    }
+    let omitted = issues.len() - kept.len();
+    let mut line = format!("{ISSUE_PREFIX}{}", kept.join(ISSUE_SEPARATOR));
+    if omitted > 0 {
+        if !kept.is_empty() {
+            line.push_str(ISSUE_SEPARATOR);
+        }
+        line.push_str(&omitted_issues(omitted));
+    }
+    line
+}
+
+fn omitted_issues(count: usize) -> String {
+    format!("(+{count} more)")
+}
+
+fn omitted_lines(count: usize) -> String {
+    format!("(+{count} more line(s) omitted)")
+}
+
+/// The account rows on their own, at the full [`REPORT_CHAR_CAP`] budget. A
+/// run that also has failed reads to report goes through [`render_payload`],
+/// which shares the same budget between the rows and the data-issues line.
+pub fn render_report(entries: &[Entry], epoch: &EpochInfo, cfg: &Config) -> String {
+    render_within(entries, epoch, cfg, REPORT_CHAR_CAP)
+}
+
+/// Renders the account rows within `budget` characters. Lowest lines drop
+/// first, since the header carries the summary the operator reads before
+/// anything else.
+fn render_within(entries: &[Entry], epoch: &EpochInfo, cfg: &Config, budget: usize) -> String {
     if entries.is_empty() {
         return "No stake accounts to report.".to_string();
     }
@@ -462,15 +699,38 @@ pub fn render_report(entries: &[Entry], epoch: &EpochInfo) -> String {
         .iter()
         .filter(|e| matches!(e.validator, Some(ValidatorStatus::Delinquent { .. })))
         .count();
+    let behind = entries
+        .iter()
+        .filter(|e| {
+            e.validator
+                .as_ref()
+                .is_some_and(|v| v.is_behind(epoch.absolute_slot, cfg.vote_lag_warn_slots))
+        })
+        .count();
+
+    // A degraded epoch reply costs the progress figure and says so, rather
+    // than printing a percentage nothing supports.
+    let epoch_part = match &epoch.progress {
+        Some(p) => format!(
+            "epoch {} at {}% (~{} h left)",
+            epoch.epoch,
+            p.pct(),
+            p.hours_to_end()
+        ),
+        None => format!("epoch {} (progress unknown)", epoch.epoch),
+    };
 
     let mut lines = vec![format!(
-        "Stake: {} account(s), {} SOL delegated, epoch {} (~{} h left).{}",
+        "Stake: {} account(s), {} SOL delegated, {epoch_part}.{}{}",
         entries.len(),
         fmt_sol(total),
-        epoch.epoch,
-        epoch.hours_to_end(),
         if delinquent > 0 {
             format!(" {delinquent} validator(s) DELINQUENT.")
+        } else {
+            String::new()
+        },
+        if behind > 0 {
+            format!(" {behind} validator(s) BEHIND.")
         } else {
             String::new()
         }
@@ -491,14 +751,18 @@ pub fn render_report(entries: &[Entry], epoch: &EpochInfo) -> String {
         if let Some(d) = &e.state.delegation {
             let voter_short: String = d.voter.chars().take(4).collect();
             let vstat = match &e.validator {
-                Some(ValidatorStatus::Ok { commission_bps }) => {
+                Some(v @ ValidatorStatus::Ok { commission_bps, .. }) => {
                     format!(
-                        "validator {voter_short}.. ok, fee {:.1}%",
+                        "validator {voter_short}.. ok, {}, fee {:.1}%",
+                        fmt_vote_lag(v, epoch, cfg.vote_lag_warn_slots),
                         *commission_bps as f64 / 100.0
                     )
                 }
-                Some(ValidatorStatus::Delinquent { .. }) => {
-                    format!("validator {voter_short}.. DELINQUENT")
+                Some(v @ ValidatorStatus::Delinquent { .. }) => {
+                    format!(
+                        "validator {voter_short}.. DELINQUENT, {}",
+                        fmt_vote_lag(v, epoch, cfg.vote_lag_warn_slots)
+                    )
                 }
                 Some(ValidatorStatus::Unknown) => format!("validator {voter_short}.. not found"),
                 None => format!("validator {voter_short}.."),
@@ -517,18 +781,21 @@ pub fn render_report(entries: &[Entry], epoch: &EpochInfo) -> String {
     }
 
     let mut report = lines.join("\n");
-    if report.len() > REPORT_CHAR_CAP {
+    if report.len() > budget {
+        // Room for the marker is reserved at the widest count it could carry,
+        // so the truncated report is provably inside the budget.
+        let reserve = omitted_lines(lines.len()).len();
         let mut kept = Vec::new();
         let mut used = 0usize;
         for line in &lines {
-            if used + line.len() + 1 > REPORT_CHAR_CAP.saturating_sub(40) {
+            if used + line.len() + 1 > budget.saturating_sub(reserve) {
                 break;
             }
             used += line.len() + 1;
             kept.push(line.clone());
         }
         let omitted = lines.len() - kept.len();
-        kept.push(format!("(+{omitted} more line(s) omitted)"));
+        kept.push(omitted_lines(omitted));
         report = kept.join("\n");
     }
     report

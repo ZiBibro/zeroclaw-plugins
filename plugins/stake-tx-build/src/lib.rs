@@ -2,10 +2,12 @@
 //!
 //! Builds an unsigned legacy Solana transaction that delegates or
 //! deactivates one of the operator's allowlisted stake accounts, returned
-//! as base64 with a human summary for the approval gate. The plugin holds
-//! no keys and cannot sign or submit; a human wallet does both. The pure
-//! core lives in [`txbuild`] with no wasm dependency, so it compiles and
-//! tests on the host with a plain `cargo test`; the wasm component reuses
+//! as base64 with a human summary for the approval gate. The genesis hash the
+//! endpoint reports is checked against the pinned cluster before anything is
+//! built, which catches an honest endpoint on the wrong chain. The
+//! plugin holds no keys and cannot sign or submit; a human wallet does both.
+//! The pure core lives in [`txbuild`] with no wasm dependency, so it compiles
+//! and tests on the host with a plain `cargo test`; the wasm component reuses
 //! the same logic through the shim below.
 //!
 //! Build:  rustup target add wasm32-wasip2
@@ -120,6 +122,22 @@ mod component {
             };
 
             let timeout = Duration::from_secs(cfg.timeout_secs);
+
+            // Cluster identity gate: one getGenesisHash read per invocation,
+            // before any transaction bytes exist. An endpoint reporting a
+            // genesis other than the pinned cluster aborts the call here,
+            // which catches an honest endpoint on the wrong chain. An
+            // endpoint that echoes the expected hash still passes; the limits
+            // are spelled out in the README threat model.
+            let genesis = match post_json(&cfg.rpc_url, &txbuild::genesis_hash_body(), timeout)
+                .and_then(|b| txbuild::parse_genesis_hash(&b))
+            {
+                Ok(g) => g,
+                Err(e) => return fail(format!("cluster check failed: {e}")),
+            };
+            if let Err(e) = txbuild::verify_cluster(cfg.cluster, &genesis) {
+                return fail(e);
+            }
 
             // Durable path: the blockhash slot is filled from the nonce
             // account state instead of the recent blockhash queue.

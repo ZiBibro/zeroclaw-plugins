@@ -4,11 +4,12 @@ use base64::Engine;
 use serde_json::Value;
 use stake_tx_build::txbuild::{
     build_transaction, compile_message, deactivate_instruction, decode_compact_u16, decode_pubkey,
-    delegate_stake_instruction, encode_compact_u16, latest_blockhash_body, nonce_account_body,
-    parse_action, parse_latest_blockhash, parse_nonce_blockhash, serialize_message,
-    serialize_transaction, validate_vote, Action, Config, StakeAccountRef, STAKE_CONFIG_ID,
-    STAKE_PROGRAM_ID, SYSTEM_PROGRAM_ID, SYSVAR_CLOCK_ID, SYSVAR_RECENT_BLOCKHASHES_ID,
-    SYSVAR_STAKE_HISTORY_ID,
+    delegate_stake_instruction, encode_compact_u16, genesis_hash_body, latest_blockhash_body,
+    nonce_account_body, parse_action, parse_genesis_hash, parse_latest_blockhash,
+    parse_nonce_blockhash, serialize_message, serialize_transaction, validate_vote, verify_cluster,
+    Action, Cluster, Config, StakeAccountRef, DEVNET_GENESIS_HASH, MAINNET_GENESIS_HASH,
+    STAKE_CONFIG_ID, STAKE_PROGRAM_ID, SYSTEM_PROGRAM_ID, SYSVAR_CLOCK_ID,
+    SYSVAR_RECENT_BLOCKHASHES_ID, SYSVAR_STAKE_HISTORY_ID, TESTNET_GENESIS_HASH,
 };
 
 /// Raw mainnet getTransaction reply for delegate signature
@@ -127,6 +128,46 @@ fn config_rejects_out_of_range_timeout() {
     }
 }
 
+#[test]
+fn config_defaults_the_cluster_to_mainnet() {
+    // An operator who never named a cluster gets the strictest pin, not a
+    // skipped check.
+    assert_eq!(base_config().cluster, Cluster::MainnetBeta);
+    assert_eq!(base_config().cluster.genesis_hash(), MAINNET_GENESIS_HASH);
+}
+
+#[test]
+fn config_parses_every_named_cluster() {
+    let cases = [
+        ("mainnet-beta", Cluster::MainnetBeta, MAINNET_GENESIS_HASH),
+        ("devnet", Cluster::Devnet, DEVNET_GENESIS_HASH),
+        ("testnet", Cluster::Testnet, TESTNET_GENESIS_HASH),
+    ];
+    for (name, expected, genesis) in cases {
+        let mut s = base_section();
+        s.insert("cluster".to_string(), name.to_string());
+        let cfg = Config::from_section(&s).unwrap_or_else(|e| panic!("cluster {name}: {e}"));
+        assert_eq!(cfg.cluster, expected);
+        assert_eq!(cfg.cluster.genesis_hash(), genesis);
+        assert_eq!(cfg.cluster.as_str(), name);
+    }
+}
+
+#[test]
+fn config_rejects_unknown_cluster_value() {
+    // Near misses included: an abbreviation and a case variant must fail
+    // closed rather than resolve to mainnet.
+    for bad in ["mainnet", "Mainnet-Beta", "localnet", ""] {
+        let mut s = base_section();
+        s.insert("cluster".to_string(), bad.to_string());
+        let err = Config::from_section(&s).unwrap_err();
+        assert!(
+            err.contains("cluster must be one of") && err.contains("mainnet-beta"),
+            "cluster `{bad}` err: {err}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Argument validation and allowlist refusals
 // ---------------------------------------------------------------------------
@@ -231,6 +272,7 @@ fn compact_u16_rejects_overflow() {
 #[test]
 fn request_bodies_carry_expected_fields() {
     assert!(latest_blockhash_body().contains("getLatestBlockhash"));
+    assert!(genesis_hash_body().contains("getGenesisHash"));
     let body = nonce_account_body(NONCE_ACC);
     assert!(body.contains("getAccountInfo"));
     assert!(body.contains(NONCE_ACC));
@@ -279,6 +321,89 @@ fn nonce_blockhash_rejects_short_data() {
         r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":{{"lamports":1,"owner":"{SYSTEM_PROGRAM_ID}","data":["{b64}","base64"],"executable":false,"rentEpoch":0,"space":40}}}},"id":1}}"#
     );
     assert!(parse_nonce_blockhash(&body).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Cluster identity gate
+// ---------------------------------------------------------------------------
+
+fn genesis_reply(hash: &str) -> String {
+    format!(r#"{{"jsonrpc":"2.0","result":"{hash}","id":1}}"#)
+}
+
+#[test]
+fn pinned_genesis_hashes_are_distinct_32_byte_values() {
+    // The mainnet constant is the published mainnet-beta genesis; the other
+    // two exist so a pinned devnet or testnet endpoint is checked just as
+    // strictly.
+    assert_eq!(
+        MAINNET_GENESIS_HASH,
+        "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+    );
+    let all = [
+        MAINNET_GENESIS_HASH,
+        DEVNET_GENESIS_HASH,
+        TESTNET_GENESIS_HASH,
+    ];
+    for hash in all {
+        assert!(
+            decode_pubkey(hash).is_ok(),
+            "{hash} must be 32 base58 bytes"
+        );
+    }
+    for (i, a) in all.iter().enumerate() {
+        assert!(!all[i + 1..].contains(a), "duplicate genesis constant {a}");
+    }
+}
+
+#[test]
+fn cluster_gate_accepts_the_matching_genesis() {
+    for cluster in [Cluster::MainnetBeta, Cluster::Devnet, Cluster::Testnet] {
+        let reported = parse_genesis_hash(&genesis_reply(cluster.genesis_hash()))
+            .unwrap_or_else(|e| panic!("{}: {e}", cluster.as_str()));
+        assert_eq!(reported, cluster.genesis_hash());
+        assert_eq!(verify_cluster(cluster, &reported), Ok(()));
+    }
+}
+
+#[test]
+fn cluster_gate_refuses_a_mismatched_genesis() {
+    // A devnet endpoint behind a config pinned to mainnet: the builder must
+    // refuse, and the error must name both sides of the mismatch.
+    let reported = parse_genesis_hash(&genesis_reply(DEVNET_GENESIS_HASH)).unwrap();
+    let err = verify_cluster(Cluster::MainnetBeta, &reported).unwrap_err();
+    assert!(err.contains("cluster mismatch"), "err: {err}");
+    assert!(err.contains(DEVNET_GENESIS_HASH), "err: {err}");
+    assert!(err.contains(MAINNET_GENESIS_HASH), "err: {err}");
+    assert!(err.contains("mainnet-beta"), "err: {err}");
+
+    // The reverse pin fails just as closed.
+    let reported = parse_genesis_hash(&genesis_reply(MAINNET_GENESIS_HASH)).unwrap();
+    assert!(verify_cluster(Cluster::Devnet, &reported).is_err());
+}
+
+#[test]
+fn cluster_gate_fails_closed_on_a_malformed_reply() {
+    // Every reply that is not a base58 32-byte hash aborts the call. None of
+    // these may fall through to a build.
+    let bad = [
+        r#"{"jsonrpc":"2.0","id":1}"#,
+        r#"{"jsonrpc":"2.0","result":null,"id":1}"#,
+        r#"{"jsonrpc":"2.0","result":42,"id":1}"#,
+        r#"{"jsonrpc":"2.0","result":{"value":"x"},"id":1}"#,
+        r#"{"jsonrpc":"2.0","result":"notbase58!","id":1}"#,
+        r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":1}"#,
+        "",
+        "<html>gateway timeout</html>",
+        &genesis_reply(""),
+        &genesis_reply(&MAINNET_GENESIS_HASH[..40]),
+    ];
+    for body in bad {
+        assert!(
+            parse_genesis_hash(body).is_err(),
+            "reply must fail closed: {body}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

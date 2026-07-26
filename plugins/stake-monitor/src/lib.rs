@@ -1,10 +1,11 @@
 //! ZeroClaw WIT tool plugin: `stake_monitor`.
 //!
 //! Read-only status for the operator's own stake accounts: delegation state,
-//! validator delinquency, and last-epoch rewards, shaped for chat. The pure
-//! core lives in [`stake`] with no wasm dependency, so it compiles and tests
-//! on the host with a plain `cargo test`; the wasm component reuses the same
-//! logic through the shim below.
+//! validator health from vote lag through formal delinquency, epoch progress,
+//! and last-epoch rewards, shaped for chat. The pure core lives in [`stake`]
+//! with no wasm dependency, so it compiles and tests on the host with a plain
+//! `cargo test`; the wasm component reuses the same logic through the shim
+//! below.
 //!
 //! Build:  rustup target add wasm32-wasip2
 //!         cargo build --target wasm32-wasip2 --release
@@ -23,7 +24,7 @@ mod component {
     use std::time::Duration;
 
     use crate::stake::{
-        self, derive_status, render_report, Config, Entry, StakeStatus, ValidatorStatus,
+        self, derive_status, render_payload, Config, Entry, StakeStatus, ValidatorStatus,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
@@ -61,9 +62,9 @@ mod component {
 
         fn description() -> String {
             "Read-only status for the operator's own Solana stake accounts: delegation \
-             state, stake amount, validator health (delinquency), and last-epoch reward. \
-             Accounts come from the plugin config allowlist; arbitrary addresses are \
-             refused."
+             state, stake amount, validator health (vote lag and delinquency), epoch \
+             progress, and last-epoch reward. Accounts come from the plugin config \
+             allowlist; arbitrary addresses are refused."
                 .to_string()
         }
 
@@ -100,6 +101,10 @@ mod component {
             let timeout = Duration::from_secs(cfg.timeout_secs);
             let rpc = |body: &str| post_json(&cfg.rpc_url, body, timeout);
 
+            // One head-slot reading for the whole run: every vote lag below is
+            // measured against this slot, so a long multi-account report can
+            // under-report the lag of its later accounts by however far the
+            // chain moved in the meantime.
             let epoch =
                 match rpc(&stake::epoch_info_body()).and_then(|b| stake::parse_epoch_info(&b)) {
                     Ok(e) => e,
@@ -142,10 +147,7 @@ mod component {
             }
 
             if entries.is_empty() {
-                return fail(format!(
-                    "every stake account read failed: {}",
-                    issues.join("; ")
-                ));
+                return fail(stake::render_total_failure(&issues));
             }
 
             // Rewards land one epoch behind, so ask for the previous one.
@@ -167,14 +169,22 @@ mod component {
                 }
             }
 
-            let mut report = render_report(&entries, &epoch);
-            if !issues.is_empty() {
-                report.push_str(&format!("\nData issues: {}", issues.join("; ")));
-            }
+            // Rows and failed reads are capped together: the char cap covers
+            // the whole delivered payload, not just the part above the
+            // data-issues line.
+            let report = render_payload(&entries, &epoch, &cfg, &issues);
 
             let delinquent = entries
                 .iter()
                 .filter(|e| matches!(e.validator, Some(ValidatorStatus::Delinquent { .. })))
+                .count();
+            let behind = entries
+                .iter()
+                .filter(|e| {
+                    e.validator
+                        .as_ref()
+                        .is_some_and(|v| v.is_behind(epoch.absolute_slot, cfg.vote_lag_warn_slots))
+                })
                 .count();
             let deactivating = entries
                 .iter()
@@ -184,7 +194,7 @@ mod component {
                 PluginAction::Complete,
                 PluginOutcome::Success,
                 &format!(
-                    "reported {} account(s), {delinquent} delinquent validator(s), {deactivating} deactivating",
+                    "reported {} account(s), {delinquent} delinquent validator(s), {behind} behind, {deactivating} deactivating",
                     entries.len()
                 ),
             );

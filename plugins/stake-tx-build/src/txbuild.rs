@@ -17,10 +17,11 @@ use serde_json::Value;
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
-const CONFIG_KEYS: [&str; 7] = [
+const CONFIG_KEYS: [&str; 8] = [
     "stake_accounts",
     "authority",
     "rpc_url",
+    "cluster",
     "allowed_vote_accounts",
     "nonce_account",
     "nonce_authority",
@@ -52,6 +53,91 @@ pub const STAKE_CONFIG_ID: &str = "StakeConfig11111111111111111111111111111111";
 /// but still mandatory in the instruction (p2-stake-tx.md section 2).
 pub const SYSVAR_RECENT_BLOCKHASHES_ID: &str = "SysvarRecentB1ockHashes11111111111111111111";
 
+/// Genesis hash of Solana mainnet-beta, the cluster identity this builder
+/// pins by default. Source: `getGenesisHash` on the public mainnet endpoint
+/// <https://api.mainnet-beta.solana.com>, the same value the Solana cluster
+/// documentation lists for mainnet-beta.
+pub const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+
+/// Genesis hash of devnet. Source: `getGenesisHash` on
+/// <https://api.devnet.solana.com>.
+pub const DEVNET_GENESIS_HASH: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+
+/// Genesis hash of testnet. Source: `getGenesisHash` on
+/// <https://api.testnet.solana.com>.
+pub const TESTNET_GENESIS_HASH: &str = "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY";
+
+// ---------------------------------------------------------------------------
+// Cluster identity
+// ---------------------------------------------------------------------------
+
+/// The cluster an operator pins `rpc_url` to. A URL proves nothing about the
+/// chain behind it, so the builder asks the endpoint for its genesis hash and
+/// compares it against the pinned value before it assembles anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cluster {
+    MainnetBeta,
+    Devnet,
+    Testnet,
+}
+
+/// Every cluster the `cluster` config key accepts, in the order the error
+/// message lists them.
+const CLUSTERS: [Cluster; 3] = [Cluster::MainnetBeta, Cluster::Devnet, Cluster::Testnet];
+
+impl Cluster {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Cluster::MainnetBeta => "mainnet-beta",
+            Cluster::Devnet => "devnet",
+            Cluster::Testnet => "testnet",
+        }
+    }
+
+    /// The genesis hash an endpoint on this cluster must report.
+    pub fn genesis_hash(self) -> &'static str {
+        match self {
+            Cluster::MainnetBeta => MAINNET_GENESIS_HASH,
+            Cluster::Devnet => DEVNET_GENESIS_HASH,
+            Cluster::Testnet => TESTNET_GENESIS_HASH,
+        }
+    }
+}
+
+/// Parses the `cluster` config value. Fail-closed: an unrecognized name is an
+/// error, never a skipped check and never a fallback to mainnet.
+pub fn parse_cluster(raw: &str) -> Result<Cluster, String> {
+    let q = raw.trim();
+    CLUSTERS
+        .iter()
+        .copied()
+        .find(|c| c.as_str() == q)
+        .ok_or_else(|| {
+            format!(
+                "cluster must be one of: {}; got `{q}`",
+                CLUSTERS
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+/// Compares the genesis hash an endpoint reported against the pinned cluster.
+/// An error here means `rpc_url` is not the chain the operator pinned, and
+/// the caller must refuse to build rather than sign off on the wrong chain.
+pub fn verify_cluster(cluster: Cluster, reported: &str) -> Result<(), String> {
+    if reported == cluster.genesis_hash() {
+        return Ok(());
+    }
+    Err(format!(
+        "cluster mismatch: rpc_url reports genesis `{reported}`, not {} `{}`",
+        cluster.as_str(),
+        cluster.genesis_hash()
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -73,6 +159,7 @@ pub struct Config {
     pub accounts: Vec<StakeAccountRef>,
     pub authority: String,
     pub rpc_url: String,
+    pub cluster: Cluster,
     pub allowed_vote_accounts: Vec<String>,
     pub nonce: Option<NoncePair>,
     pub timeout_secs: u64,
@@ -113,6 +200,13 @@ impl Config {
             return Err(format!("rpc_url must be an https:// URL, got `{rpc_url}`"));
         }
 
+        // Unset means mainnet-beta: the default is the strictest reading of
+        // an operator who never said which chain they meant.
+        let cluster = match section.get("cluster") {
+            Some(raw) => parse_cluster(raw)?,
+            None => Cluster::MainnetBeta,
+        };
+
         let allowed_vote_accounts = match section.get("allowed_vote_accounts") {
             Some(raw) => parse_vote_allowlist(raw)?,
             None => Vec::new(),
@@ -152,6 +246,7 @@ impl Config {
             accounts,
             authority,
             rpc_url,
+            cluster,
             allowed_vote_accounts,
             nonce,
             timeout_secs,
@@ -320,6 +415,13 @@ pub fn latest_blockhash_body() -> String {
     .to_string()
 }
 
+pub fn genesis_hash_body() -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "getGenesisHash", "params": []
+    })
+    .to_string()
+}
+
 pub fn nonce_account_body(pubkey: &str) -> String {
     serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
@@ -338,6 +440,18 @@ fn rpc_result(body: &str) -> Result<Value, String> {
     root.get("result")
         .cloned()
         .ok_or_else(|| "RPC reply has no result".to_string())
+}
+
+/// Extracts the cluster genesis hash from a `getGenesisHash` reply, whose
+/// result is the bare base58 hash. A missing, null, or malformed result is an
+/// error rather than a skipped check, so an endpoint that answers with
+/// anything unexpected fails the gate instead of passing it.
+pub fn parse_genesis_hash(body: &str) -> Result<String, String> {
+    let r = rpc_result(body)?;
+    let hash = r.as_str().ok_or("getGenesisHash reply has no hash")?.trim();
+    validate_pubkey(hash)
+        .map_err(|_| format!("genesis hash `{hash}` is not 32 bytes of base58"))?;
+    Ok(hash.to_string())
 }
 
 pub fn parse_latest_blockhash(body: &str) -> Result<[u8; 32], String> {

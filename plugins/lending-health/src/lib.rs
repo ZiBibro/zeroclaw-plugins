@@ -25,7 +25,7 @@ mod component {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use crate::health::{render_report, Config, Position, Protocol};
+    use crate::health::{render_payload, render_total_failure, Config, Position, Protocol};
     use crate::{kamino, marginfi};
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
@@ -163,14 +163,11 @@ mod component {
             }
 
             if succeeded == 0 {
-                let detail = issues.join("; ");
-                return fail(format!("every data source failed: {detail}"));
+                return fail(render_total_failure(&issues));
             }
 
-            let mut report = render_report(&positions, &cfg);
-            if !issues.is_empty() {
-                report.push_str(&format!("\nData issues: {}", issues.join("; ")));
-            }
+            // Failures ride along inside the same cap as the report itself.
+            let report = render_payload(&positions, &issues, &cfg);
 
             emit(
                 PluginAction::Complete,

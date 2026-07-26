@@ -17,16 +17,52 @@ delegated, the validator's health, and whether the account earned a reward in
 the previous epoch. The lifecycle status is one of `activating`, `active`,
 `deactivating`, or `inactive`; an account with no delegation is reported as such.
 A header line counts the accounts, sums the delegated stake, names the current
-epoch with a rough "hours left" hint, and raises a `DELINQUENT` flag when any
-validator is behind.
+epoch with its progress and a rough "hours left" hint, and raises a `DELINQUENT`
+or `BEHIND` flag when a validator earns one.
 
 The reading is assembled from a few narrow RPC calls. `getEpochInfo` gives the
-epoch and the time-left hint. `getAccountInfo` with `jsonParsed` yields the
-delegation. `getVoteAccounts` is filtered by `votePubkey` so the reply is a
-single validator record instead of the whole roster. `getInflationReward` for
-the prior epoch supplies the last reward. The optional `account` argument selects
-one allowlisted entry by label or pubkey; omit it to report every configured
-account.
+epoch and the network head slot, plus the progress and time-left figures.
+`getAccountInfo` with `jsonParsed` yields the delegation. `getVoteAccounts` is
+filtered by `votePubkey` so the reply is a single validator record instead of
+the whole roster. `getInflationReward` for the prior epoch supplies the last
+reward. The optional `account` argument selects one allowlisted entry by label
+or pubkey; omit it to report every configured account.
+
+## Drift before delinquency
+
+Delinquency is a verdict, and by the time the RPC hands it down the stake has
+already missed rewards. The earlier signal is vote lag: how far the validator's
+last vote trails the network head, in slots. A healthy node sits within a slot
+or two of the head. Past `vote_lag_warn_slots` the line is marked `BEHIND` and
+the header counts it, which gives the operator a window to act while the
+validator is still voting. The default threshold is 32 slots, roughly 13 seconds
+of missed voting.
+
+That default is a quarter of the delinquency distance. `getVoteAccounts` takes a
+`delinquentSlotDistance` parameter and applies a default when the call leaves it
+out; Anza's `@solana/kit` RPC typings document that default as `128n`
+(`packages/rpc-api/src/getVoteAccounts.ts`). This plugin never overrides the
+parameter, so the warning lands well before the verdict the RPC reaches on its
+own. That same 128 is the ceiling accepted for `vote_lag_warn_slots`, since a
+threshold above it could only fire after the delinquency flag it is meant to
+precede.
+
+Epoch progress rides along with it. The header reads `epoch 1004 at 45%`, so a
+briefing names the running epoch and says how close the next boundary is. That
+distance decides whether a redelegation lands this epoch or the next.
+
+Neither reading costs an extra RPC call. Vote lag comes from `lastVote` on the
+vote record the plugin already fetches, measured against `absoluteSlot` from the
+epoch reply it already fetches. Delinquency detection is untouched. A validator
+the RPC lists as delinquent is still reported as `DELINQUENT`, with its lag
+printed alongside for scale, and it is never double-flagged as `BEHIND`.
+
+One caveat on the lag figure. The head slot is read once, in the `getEpochInfo`
+call that opens the run, and every account in the report is measured against
+that single number. On a multi-account report the chain keeps moving while the
+later accounts are fetched, so those accounts can under-report their lag by
+however far it moved in the meantime. The error only runs one way: a printed lag
+is a floor, and the real distance can only be larger.
 
 ## Custody tier
 
@@ -47,6 +83,7 @@ plugin refuses to run without a configured allowlist.
 |---|---|---|---|
 | `stake_accounts` | yes | — | Comma-separated allowlist. Each entry is `label:pubkey`, or a bare pubkey that is auto-labelled `stake1`, `stake2`, and so on. At least one valid base58 pubkey is required. |
 | `rpc_url` | yes | — | The operator's own Solana JSON-RPC endpoint. Must be `https://`. A trailing slash is trimmed. |
+| `vote_lag_warn_slots` | no | `32` | Vote lag, in slots, past which a still-voting validator is flagged `BEHIND`. Bounded to 1 through 128, the delinquency distance the RPC applies on its own. |
 | `timeout_secs` | no | `10` | Per-request connect timeout in seconds, bounded to 1 through 60. |
 
 ## Threat model
@@ -59,31 +96,52 @@ plugin refuses to run without a configured allowlist.
   what the tool can read, so an explicit allowlist is both cheaper and tighter.
 - **Fail-closed config.** An unknown config key is a hard error rather than a
   silently ignored typo, which surfaces a misspelled key immediately. `rpc_url`
-  must be `https://`, and `timeout_secs` is bounded.
+  must be `https://`, and both `vote_lag_warn_slots` and `timeout_secs` are
+  range-bounded.
 - **Authoritative commission.** Commission is read from `commissionBps`, the
   authoritative field. The legacy `commission` percentage can be null even when a
   reward exists, so it is used only as a fallback.
-- **Bounded output.** The report is capped near 900 characters, roughly 200
-  tokens, so a scheduled briefing can never flood the agent's context.
+- **No invented numbers.** A degraded reply never becomes a reassuring figure. A
+  vote record with no `lastVote`, or the `0` an account that has never voted
+  reports, prints `vote lag unknown` rather than a lag of zero. A `getEpochInfo`
+  reply missing `absoluteSlot` costs the lag reading the same way, and slot
+  counters that cannot describe a real epoch print `epoch N (progress unknown)`
+  instead of a patched-up percentage.
+- **Partial degradation.** A source that reads badly costs its own line and
+  nothing else. Only the epoch number is load-bearing, because the delegation
+  lifecycle is derived from it; a head slot or a slot counter that fails to read
+  drops the reading it feeds while delegation state, amounts, delinquency, and
+  rewards all still render.
+- **Bounded output.** The delivered payload is capped near 900 characters,
+  roughly 200 tokens, with the trailing data-issues line counted inside that
+  budget, so a scheduled briefing can never flood the agent's context. Rows past
+  the cap are counted in a trailing marker rather than dropped in silence.
 - **Narrow egress.** The `http_client` permission reaches only the configured
   `rpc_url`. No other host is contacted, and the pure core in `src/stake.rs` does
   no I/O at all.
 
 ## A worked example
 
-A single active account, reported live against mainnet:
+A single active account whose validator has started to drift:
 
 ```
-Stake: 1 account(s), 500 SOL delegated, epoch 1004 (~47 h left).
-[active] main: 500 SOL, validator GHVi.. ok, fee 100.0%, no reward last epoch
+Stake: 1 account(s), 500 SOL delegated, epoch 1004 at 45% (~26 h left). 1 validator(s) BEHIND.
+[active] main: 500 SOL, validator GHVi.. ok, vote lag 67 slot(s) BEHIND, fee 100.0%, no reward last epoch
 ```
 
-The header sums the position and dates it to an epoch. The account line is where
-the tool earns its keep: it read the validator's fee as `100.0%` and, in the same
-breath, showed `no reward last epoch`. Those two facts explain each other. A
-validator taking full commission leaves the staker with nothing, and the tool
-surfaces that from one line without anyone opening an explorer. An operator
-reading this briefing knows to redelegate.
+Exactly one pairing in that block is a live mainnet reading, captured during the
+verification run on 2026-07-18: the validator's `100.0%` fee and the `no reward
+last epoch` beside it. Those two facts explain each other, because a validator
+taking full commission leaves the staker with nothing. Everything else is
+constructed to show the shape of a drifting account. The 500 SOL balance and the
+67-slot lag are illustrative figures rather than readings, and so are the epoch
+number and the progress and hours-left hint printed next to it.
+
+The header sums the position and dates it to an epoch, including how far that
+epoch has already run. The lag reading is the other lever: a validator still in
+the RPC's `current` list keeps the delinquency check silent, yet a lag past the
+warn threshold marks the line `BEHIND`. An operator reading this briefing knows
+to redelegate, and knows it a day before the epoch closes.
 
 ## Prompt-injection test
 
@@ -152,6 +210,7 @@ name = "stake-monitor"
 [plugins.entries.config]
 stake_accounts = "main:6ySLTQWEpCFKPYKfPaKYnhKzEccuqKafFEzfJVQ4Gifp"
 rpc_url = "https://your-own-rpc.example.com"
+vote_lag_warn_slots = "32"
 timeout_secs = "10"
 ```
 

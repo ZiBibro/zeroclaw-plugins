@@ -5,9 +5,10 @@ author = "ZiBibro"
 wasm_path = "stake_tx_build.wasm"
 capabilities = ["tool"]
 # http_client: outbound HTTPS to the operator's own Solana RPC endpoint only,
-# used for a fresh blockhash (or the durable nonce account state).
-# config_read: the stake account allowlist, the authority pubkey, and the
-# vote account allowlist live in this plugin's jailed config section,
-# injected as `__config`. No private key ever appears in config; the plugin
-# refuses to run without the allowlists.
+# used for the cluster genesis hash and for a fresh blockhash (or the durable
+# nonce account state).
+# config_read: the stake account allowlist, the authority pubkey, the pinned
+# cluster, and the vote account allowlist live in this plugin's jailed config
+# section, injected as `__config`. No private key ever appears in config; the
+# plugin refuses to run without the allowlists.
 permissions = ["http_client", "config_read"]

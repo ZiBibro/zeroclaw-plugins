@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use crate::health::{Position, Protocol};
+use crate::health::{short_account, Liquidation, Position, Protocol};
 
 /// Products in the portfolio response that carry lending-style obligations.
 /// Multiply and leverage obligations do not appear in the `lending` array,
@@ -62,15 +62,28 @@ fn parse_row(
         .and_then(Value::as_str)
         .map(short_pubkey)
         .unwrap_or_else(|| "?".to_string());
+    // The obligation address is the identity of the position itself; a wallet
+    // can hold several in one market, so the report names the one it read.
+    let account = row
+        .get("obligation")
+        .and_then(Value::as_str)
+        .map(short_account)
+        .unwrap_or_else(|| "?".to_string());
 
     Some(Position {
         wallet_label: wallet_label.to_string(),
         protocol: Protocol::Kamino,
         market: format!("{tag}@{market}"),
+        account,
         deposit_usd,
         borrow_usd,
-        ltv,
-        liquidation_ltv,
+        liquidation: Some(Liquidation {
+            ltv,
+            liquidation_ltv,
+        }),
+        // The portfolio response carries no protocol-side liquidatable flag;
+        // the ratio it does carry is the whole verdict here.
+        flagged_unhealthy: false,
         stale_hint,
     })
 }

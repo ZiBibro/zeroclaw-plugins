@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use lending_health::health::{
-    classify, render_report, validate_pubkey, Config, Position, Protocol, Risk, REPORT_CHAR_CAP,
+    classify, classify_position, render_payload, render_report, render_total_failure,
+    short_account, validate_pubkey, Config, Liquidation, Position, Protocol, Risk, REPORT_CHAR_CAP,
 };
 
 const WALLET_A: &str = "86xCnPeV69n6t3DnyGvkKobf9FdN2H9oiVDdaMpo2MMY";
@@ -160,12 +161,140 @@ fn position(label: &str, market: &str, ltv: f64) -> Position {
         wallet_label: label.to_string(),
         protocol: Protocol::Kamino,
         market: market.to_string(),
+        account: "6FJt..SSLy".to_string(),
         deposit_usd: 1000.0,
         borrow_usd: 400.0,
-        ltv,
-        liquidation_ltv: 0.85,
+        liquidation: Some(Liquidation {
+            ltv,
+            liquidation_ltv: 0.85,
+        }),
+        flagged_unhealthy: false,
         stale_hint: None,
     }
+}
+
+/// A position the protocol itself condemned, with no basis left to measure a
+/// distance on: the shape MarginFi returns for a zeroed maintenance pair.
+fn condemned(label: &str, market: &str) -> Position {
+    Position {
+        liquidation: None,
+        flagged_unhealthy: true,
+        stale_hint: Some("maint basis unavailable; flagged unhealthy".to_string()),
+        ..position(label, market, 0.0)
+    }
+}
+
+#[test]
+fn short_account_keeps_head_and_tail() {
+    assert_eq!(short_account(WALLET_A), "86xC..2MMY");
+    assert_eq!(short_account(WALLET_B), "9WzD..AWWM");
+    assert_eq!(short_account("?"), "?");
+}
+
+#[test]
+fn classify_position_marks_missing_basis_unknown() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let measured = position("main", "usdc", 0.70);
+    assert_eq!(classify_position(&measured, &cfg), Risk::Warn);
+    let mut blind = measured.clone();
+    blind.liquidation = None;
+    assert_eq!(classify_position(&blind, &cfg), Risk::Unknown);
+}
+
+#[test]
+fn classify_position_keeps_a_condemned_account_critical_without_a_basis() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let p = condemned("main", "acct");
+    assert!(p.liquidation.is_none());
+    assert_eq!(classify_position(&p, &cfg), Risk::Critical);
+}
+
+#[test]
+fn condemned_position_leads_the_report_and_survives_the_cap() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let mut positions = vec![condemned("main", "condemned")];
+    positions.extend((0..60).map(|i| position("main", &format!("market-{i:02}"), 0.70)));
+    let report = render_report(&positions, &cfg);
+
+    assert!(report.starts_with("Lending health: 61 position(s), worst risk CRITICAL."));
+    let first_line = report.lines().nth(1).expect("a data line must render");
+    assert!(
+        first_line.starts_with("[CRITICAL] main"),
+        "line: {first_line}"
+    );
+    assert!(first_line.contains("condemned"), "line: {first_line}");
+    assert!(first_line.contains("LTV n/a"), "line: {first_line}");
+    // The cap drops warnings from the tail; the condemned line is never among
+    // the casualties, and no number is invented to keep it there.
+    assert!(report.contains("omitted"), "report: {report}");
+    assert!(report.len() <= REPORT_CHAR_CAP);
+}
+
+#[test]
+fn condemned_position_outranks_a_measured_critical_below_the_line() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let positions = vec![
+        position("main", "burning", 0.90),
+        condemned("main", "condemned"),
+        position("main", "past-the-line", 1.20),
+    ];
+    let report = render_report(&positions, &cfg);
+    let past = report.find("past-the-line").unwrap();
+    let cond = report.find("condemned").unwrap();
+    let burning = report.find("burning").unwrap();
+    assert!(past < cond, "report: {report}");
+    assert!(cond < burning, "report: {report}");
+}
+
+#[test]
+fn report_echoes_the_obligation_identity() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let mut p = position("main", "Vanilla@47tf", 0.5);
+    p.account = "HcrU..iS4J".to_string();
+    let report = render_report(&[p], &cfg);
+    assert!(
+        report.contains("Vanilla@47tf #HcrU..iS4J:"),
+        "report: {report}"
+    );
+}
+
+#[test]
+fn report_states_no_distance_without_a_basis() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let mut p = position("main", "acct", 0.0);
+    p.liquidation = None;
+    p.stale_hint = Some("maint basis unavailable".to_string());
+    let report = render_report(&[p], &cfg);
+    assert!(report.contains("[UNKNOWN]"), "report: {report}");
+    assert!(
+        report.contains("LTV n/a (maint basis unavailable)"),
+        "report: {report}"
+    );
+    assert!(!report.contains("liq"), "no line may be stated: {report}");
+    // The values that survive the missing basis are still reported.
+    assert!(
+        report.contains("deposit $1000, borrow $400"),
+        "report: {report}"
+    );
+}
+
+#[test]
+fn unknown_basis_outranks_calm_but_not_measured_risk() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let mut blind = position("main", "blind", 0.0);
+    blind.liquidation = None;
+    let positions = vec![
+        position("main", "calm", 0.10),
+        blind,
+        position("main", "warm", 0.70),
+    ];
+    let report = render_report(&positions, &cfg);
+    let warm = report.find("warm").unwrap();
+    let unmeasured = report.find("blind").unwrap();
+    let calm = report.find("calm").unwrap();
+    assert!(warm < unmeasured, "report: {report}");
+    assert!(unmeasured < calm, "report: {report}");
+    assert!(report.starts_with("Lending health: 3 position(s), worst risk WARN."));
 }
 
 #[test]
@@ -211,8 +340,94 @@ fn report_stays_under_char_cap() {
 }
 
 #[test]
+fn delivered_payload_stays_under_the_cap_with_data_issues() {
+    // A report long enough to truncate on its own, plus a run of failures long
+    // enough to overrun the cap if it were appended after the truncation.
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let positions: Vec<Position> = (0..60)
+        .map(|i| position("main", &format!("market-{i:02}"), 0.5))
+        .collect();
+    let issues: Vec<String> = (0..12)
+        .map(|i| format!("marginfi wallet-{i:02}: HTTP 500"))
+        .collect();
+    let payload = render_payload(&positions, &issues, &cfg);
+    assert!(
+        payload.len() <= REPORT_CHAR_CAP,
+        "payload length {} exceeds cap {}",
+        payload.len(),
+        REPORT_CHAR_CAP
+    );
+    assert!(payload.contains("omitted"), "payload: {payload}");
+    assert!(
+        payload.contains("\nData issues: marginfi wallet-00: HTTP 500"),
+        "payload: {payload}"
+    );
+    // The trimmed tail of the failure list is accounted for, never silent.
+    assert!(payload.contains("more)"), "payload: {payload}");
+}
+
+#[test]
+fn payload_without_data_issues_is_the_report_alone() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let positions = vec![position("main", "usdc", 0.5)];
+    assert_eq!(
+        render_payload(&positions, &[], &cfg),
+        render_report(&positions, &cfg)
+    );
+}
+
+#[test]
+fn a_single_oversized_data_issue_collapses_to_a_count() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let issues = vec!["e".repeat(REPORT_CHAR_CAP * 2)];
+    let payload = render_payload(&[position("main", "usdc", 0.5)], &issues, &cfg);
+    assert!(
+        payload.len() <= REPORT_CHAR_CAP,
+        "payload length {} exceeds cap {}",
+        payload.len(),
+        REPORT_CHAR_CAP
+    );
+    assert!(
+        payload.contains("\nData issues: 1 source call(s) failed"),
+        "payload: {payload}"
+    );
+}
+
+#[test]
 fn empty_positions_render_calm_message() {
     let cfg = Config::from_section(&base_section()).unwrap();
     let report = render_report(&[], &cfg);
     assert!(report.contains("No open lending positions"));
+}
+
+#[test]
+fn total_failure_text_stays_inside_the_issue_budget() {
+    // Every source failed and each upstream message is long and server-controlled.
+    let issues: Vec<String> = (0..12)
+        .map(|i| format!("kamino wallet-{i}: rpc error {}", "x".repeat(120)))
+        .collect();
+    let text = render_total_failure(&issues);
+
+    assert!(text.starts_with("every data source failed: "));
+    // The failure path is bounded by the same budget as the delivered report,
+    // so a pile of long RPC errors cannot flood the agent context.
+    assert!(
+        text.len() <= REPORT_CHAR_CAP,
+        "failure text {} chars, cap {REPORT_CHAR_CAP}",
+        text.len()
+    );
+    // Whatever the budget pushed out is counted rather than dropped silently.
+    assert!(
+        text.contains("more"),
+        "dropped issues are not counted: {text}"
+    );
+}
+
+#[test]
+fn total_failure_text_states_a_single_short_issue_in_full() {
+    let issues = vec!["kamino main: http 503".to_string()];
+    assert_eq!(
+        render_total_failure(&issues),
+        "every data source failed: kamino main: http 503"
+    );
 }

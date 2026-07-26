@@ -18,6 +18,10 @@ over the operator's own Solana JSON-RPC endpoint, with the maintenance-weighted
 asset and liability values read at fixed byte offsets. For each position the
 tool computes current LTV against that market's liquidation LTV.
 
+Every line names the obligation or account address it was decoded from,
+shortened to a head and a tail, so a report covering several positions in the
+same market says which one each figure belongs to.
+
 Two thresholds split the risk scale. Below `warn_ltv` a position reads `OK`. At
 or above `warn_ltv` it reads `WARN`, and at or above `critical_ltv` it escalates
 to `CRITICAL`. The report lists one line per position, worst risk first, and the
@@ -25,6 +29,32 @@ whole thing is capped near 200 tokens so a recurring briefing never floods the
 agent context. Positions that the Kamino indexer has not refreshed against the
 current price feed carry a staleness hint, so an old snapshot is never presented
 as live.
+
+A fourth status, `UNKNOWN`, covers the case where the source gave the tool
+nothing to measure against. MarginFi's risk engine zeroes the maintenance pair
+in its health cache when it cannot price an account, and the initial-weight pair
+that remains sits on a different basis against a different line, so it cannot
+stand in. Such a position keeps the values it does carry and the marker `maint
+basis unavailable`; no LTV figure is printed for it. It sorts above the calm
+lines and below the measured warnings.
+
+One case escapes `UNKNOWN`. MarginFi keeps a `HEALTHY` bit that its risk engine
+sets itself, and a cleared bit is a verdict the protocol already reached, so it
+needs no basis of ours to be believed. That verdict travels beside the numbers
+rather than inside them, which gives the condemned account two renderings. With
+a maintenance pair on hand, the line prints the ratio that pair measures and
+carries the marker `flagged unhealthy` after it. With the pair zeroed, the line
+prints `LTV n/a` and the marker joins the `maint basis unavailable` note. Either
+way the line reads `CRITICAL` and leads the report, where it stays while the
+character cap drops lower-severity lines from the tail.
+
+The verdict is only read when the engine wrote it. The same flag word carries an
+`ENGINE_STATUS_OK` bit, set when the last risk check ran through. A flag word
+without that bit holds whatever stood there before, down to the all-zero word an
+account carries before its first check ever runs, so a cleared `HEALTHY` beside
+it is the absence of a verdict. Such a position reads `UNKNOWN` with the marker
+`engine status unset` and no LTV figure, because a cache nobody wrote is not
+evidence either way.
 
 Drift is deliberately out of scope. Its API does not expose a current health or
 liquidation figure for an open position, so the tool would have to reconstruct
@@ -55,7 +85,7 @@ src/health.rs     # pure core: config parsing, request planning, risk classifica
 src/kamino.rs     # Kamino REST path: URL building and portfolio parsing
 src/marginfi.rs   # MarginFi path: getProgramAccounts body and raw account decoding
 src/lib.rs        # thin #[cfg(target_family = "wasm")] component shim over the core
-tests/            # host-run tests over the pure core, with captured live API fixtures
+tests/            # host-run tests over the pure core, with live API fixtures plus one synthetic account
 manifest.toml     # name, version, wasm_path, capabilities, permissions
 ```
 
@@ -130,28 +160,58 @@ call are never appended to the report, so one wallet's broken response cannot
 drag another payload into the agent context. When at least one source succeeds
 the report still renders, with the failures listed as short data issues; when
 every source fails the tool returns an error rather than an empty all-clear.
+That failure list is written under the same character cap as the report and out
+of a budget reserved inside it, so a bad day upstream trims its own list instead
+of pushing the delivered payload past the bound the operator was promised.
+
+**No stand-in numbers.** A liquidation distance is printed only when the source
+supplied the basis it is measured on. When MarginFi's health cache comes back
+with a zeroed maintenance pair, the position is reported as `UNKNOWN` with the
+marker `maint basis unavailable` rather than with a ratio computed on the
+initial-weight pair, which would answer a question the data did not answer. An
+operator reading a margin briefing can act on a missing figure; a plausible
+wrong one is what gets a position liquidated. The suppression stops at the
+figure: a cleared `HEALTHY` flag still classifies the account `CRITICAL`, so a
+missing basis can never demote a position the protocol already condemned. The
+figure is never bent the other way either. A condemned account with a
+maintenance pair prints the ratio that pair measures, since a distance floored
+at the liquidation line would be a stand-in number of the same kind, printed
+beside a deposit and a borrow that visibly disagree with it. And a flag word the
+engine never wrote condemns nothing at all: with `ENGINE_STATUS_OK` unset the
+cache is unknown state, which reads `UNKNOWN` rather than a `CRITICAL` invented
+from a bit nobody set.
 
 **No custody.** As above, the plugin holds no keys and issues no writes, so a
 prompt-injection ceiling is a wrong or refused report, not a lost position.
 
 ## A worked example
 
-A run over one demo wallet with three open Kamino positions:
+The report the tool renders over the captured fixtures in `tests/fixtures/`:
+three open Kamino positions and one MarginFi account. The two captures were
+taken from two different wallets and are stitched here under a single `demo`
+label. Every figure below is decoded from those files, and
+`tests/readme_example.rs` pins this exact block to the rendered output.
 
 ```
-Lending health: 3 position(s), worst risk WARN.
-[WARN] demo kamino Vanilla@7u3H: deposit $53930, borrow $40471, LTV 75.0% of 79.9% liq (positions stale 40 h)
-[WARN] demo kamino Multiply@47tf: deposit $65030, borrow $42580, LTV 65.5% of 75.0% liq (positions stale 63 h)
-[OK] demo kamino Vanilla@47tf: deposit $200638, borrow $125170, LTV 62.4% of 75.0% liq (positions stale 40 h)
+Lending health: 4 position(s), worst risk WARN.
+[WARN] demo kamino Vanilla@7u3H #HcrU..iS4J: deposit $53724, borrow $40471, LTV 75.3% of 79.9% liq (positions stale 39 h)
+[WARN] demo kamino Multiply@47tf #FWjx..Vq67: deposit $65030, borrow $42580, LTV 65.5% of 75.0% liq (positions stale 61 h)
+[UNKNOWN] demo marginfi acct #EN1W..K7ND: deposit $860, borrow $668, LTV n/a (maint basis unavailable)
+[OK] demo kamino Vanilla@47tf #6FJt..SSLy: deposit $200638, borrow $125169, LTV 62.4% of 75.0% liq (positions stale 39 h)
 ```
 
 Read the first data line as: the `demo` wallet holds a Kamino `Vanilla` position
-in the market whose pubkey starts `7u3H`, with $53,930 deposited against $40,471
-borrowed. Its LTV of 75.0% is close to the 79.9% liquidation LTV, so it is
-flagged `WARN`. The trailing hint says the Kamino indexer's position snapshot
-lags the price feed by 40 hours, so the figure is a recent read rather than a
-live one. The header names the count and the worst status up front, which is the
-part a scheduled briefing surfaces first.
+in the market whose pubkey starts `7u3H`, under obligation `HcrU..iS4J`, with
+$53,724 deposited against $40,471 borrowed. Its LTV of 75.3% is close to the
+79.9% liquidation LTV, so it is flagged `WARN`. The trailing hint says the Kamino
+indexer's position snapshot lags the price feed by 39 hours, so the figure is a
+recent read rather than a live one. The header names the count and the worst
+status up front, which is the part a scheduled briefing surfaces first.
+
+The `UNKNOWN` line is the honest half of this report. That MarginFi account was
+captured with a zeroed maintenance pair, so the tool prints the values it read
+and stops there. No percentage appears on that line, because none of the numbers
+on hand measures how far the account sits from its liquidation line.
 
 ## Prompt-injection test
 

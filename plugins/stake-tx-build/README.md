@@ -19,6 +19,13 @@ and base64 codecs, the compact-u16 length prefixes, the legacy message header,
 and the bincode discriminants for each program instruction. That keeps the wasm
 artifact small and the transaction layout auditable down to the byte.
 
+Before any of that, the plugin asks the configured endpoint for its genesis
+hash and compares it against the pinned cluster, which defaults to
+mainnet-beta. One extra read per call, and a mismatch aborts before a single
+transaction byte exists. A URL alone says nothing about the chain behind it, so
+an endpoint that answers honestly while serving devnet or testnet is caught by
+its own reply. The threat model below states the limits of that check.
+
 A durable nonce is optional. When the config sets `nonce_account` together with
 `nonce_authority`, the first instruction becomes `AdvanceNonceAccount` and the
 transaction draws its blockhash from the nonce account state, so it does not go
@@ -41,10 +48,16 @@ and injects it as a flat `string -> string` map (`__config`), gated behind the
 | `stake_accounts` | (required) | Comma-separated allowlist. Each entry is `label:pubkey` or a bare pubkey. The only stake accounts the tool will act on. |
 | `authority` | (required) | Fee payer and stake authority **public key**. Never a private key. |
 | `rpc_url` | (required) | HTTPS Solana RPC endpoint read for a blockhash. Must start with `https://`. |
+| `cluster` | `mainnet-beta` | Cluster the endpoint's reported genesis hash must match. Stays on `mainnet-beta` unless the operator names another public cluster; the alternatives are `devnet` and `testnet`. Any other value is rejected. |
 | `allowed_vote_accounts` | (empty) | Comma-separated allowlist of vote accounts eligible as delegation targets. Empty disables `delegate` entirely. |
 | `nonce_account` | (unset) | Durable nonce account pubkey. Set with `nonce_authority` to build a transaction that survives an approval queue. |
 | `nonce_authority` | (unset) | Authority pubkey for the durable nonce. Must be set together with `nonce_account`. |
 | `timeout_secs` | `10` | Connect timeout for the RPC call, between 1 and 60. |
+
+Upgrading from a version without the cluster gate: `cluster` now defaults to
+`mainnet-beta`, so a config whose `rpc_url` points at devnet or testnet fails
+on every call until the section adds the matching key, `cluster = "devnet"` or
+`cluster = "testnet"`. A config already on mainnet needs no change.
 
 The call itself takes an `action` of `delegate` or `deactivate` and a
 `stake_account` given as a label or pubkey from the allowlist. A `delegate`
@@ -71,14 +84,15 @@ cp target/wasm32-wasip2/release/stake_tx_build.wasm stake_tx_build.wasm
 
 ## Custody tier
 
-This tool builds unsigned transactions and holds no keys. The only outbound
-call it makes is a read to the operator's own RPC endpoint, for a blockhash or
-the nonce account state. Everything it produces is inert until a human signs it
-in a wallet the plugin never sees. On its own it cannot move a single lamport.
+This tool builds unsigned transactions and holds no keys. Its only outbound
+calls are reads against the operator's own RPC endpoint: the cluster genesis
+hash, then a blockhash or the nonce account state. Everything it produces is
+inert until a human signs it in a wallet the plugin never sees. On its own it
+cannot move a single lamport.
 
-The manifest asks for exactly two permissions: `http_client` for that RPC read
-and `config_read` for its own jailed config section. Neither one can sign or
-spend, and the plugin requests nothing beyond them.
+The manifest asks for exactly two permissions: `http_client` for those RPC
+reads and `config_read` for its own jailed config section. Neither one can sign
+or spend, and the plugin requests nothing beyond them.
 
 ## Threat model
 
@@ -94,8 +108,25 @@ defenses do not depend on the agent behaving.
 - **The authority is a public key, never a secret.** `authority` names the fee
   payer and stake authority. No config field accepts private-key material, so
   there is nothing to leak.
+- **The endpoint has to report its chain, and the report is checked.** Every
+  call reads `getGenesisHash` and compares the reply against the pinned
+  `cluster`. A mismatch refuses; a reply that is absent or malformed refuses
+  the same way. What this catches is an honest endpoint on the wrong chain: an
+  `rpc_url` left pointing at devnet or testnet, or a `cluster` typo that would
+  otherwise have bytes assembled against a cluster the operator never meant.
+  What it does not catch: a hostile proxy answers `getGenesisHash` with the
+  mainnet constant and passes, because nothing binds that reply to the
+  blockhash that follows, and a chain forked from mainnet inherits mainnet's
+  genesis hash, so it answers correctly too. Trust in the endpoint itself stays
+  with the operator who configured it. Host tests cover the decision logic in
+  the pure core: the reply parse, and the refusal on either a mismatch or a
+  malformed reply. That the gate runs before any transaction byte is assembled
+  lives in the wasm shim in `src/lib.rs`, alongside the blockhash and nonce
+  reads, and is not exercised by `cargo test`.
 - **Unknown config keys fail closed.** A typo such as `allowed_vote_account`
-  does not silently weaken an allowlist; parsing stops with an error.
+  does not silently weaken an allowlist; parsing stops with an error. The same
+  holds for `cluster`: `mainnet` is not `mainnet-beta`, and the near miss is
+  rejected instead of resolved.
 - **Unexpected arguments fail closed.** The argument schema rejects any field it
   does not recognize, so a smuggled parameter aborts the call.
 
@@ -118,6 +149,14 @@ Decoded byte for byte, the deactivation instruction verifies against the Stake
 program: program `Stake11111111111111111111111111111111111111`, accounts
 `[stake, clock, authority]`, data `05000000`. Nothing about the staked amount
 appears anywhere, because the builder never reads it.
+
+The same call against an `rpc_url` that turns out to be devnet returns no
+transaction at all:
+
+```
+success=false
+error: cluster mismatch: rpc_url reports genesis `EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG`, not mainnet-beta `5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d`
+```
 
 ## Prompt-injection test
 
