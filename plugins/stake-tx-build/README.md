@@ -206,3 +206,48 @@ Run the agent with a build that includes a compiler backend, e.g.
 (`--features plugins-wasm`), precompile with a matching wasmtime:
 `wasmtime compile --target <triple> stake_tx_build.wasm -o stake_tx_build.cwasm`
 and point `wasm_path` at the `.cwasm`.
+
+## Operating notes
+
+Both of these surfaced while driving the plugin through a real Telegram channel,
+and neither is visible from reading the code. They cost an operator an evening
+to rediscover.
+
+**Getting the transaction out of the channel intact.** The host scans outbound
+channel messages for leaked credentials and replaces high-entropy tokens with
+`[REDACTED_HIGH_ENTROPY_TOKEN]`. A base64 transaction trips that heuristic. The
+deactivate transaction measured here was 169 characters with a Shannon entropy
+of 5.57, against a default threshold of 4.375, so the operator receives a
+placeholder where the transaction should be. Set
+
+```toml
+[security.leak_detection]
+high_entropy_tokens = false
+```
+
+to switch off the entropy heuristic while the deterministic patterns for real
+credentials keep running: Anthropic, OpenAI, GitHub, Stripe, Google and Groq
+keys are all still redacted. An unsigned transaction is not a secret. It carries
+no key material and stays inert until someone signs it, which is the whole
+premise of this plugin.
+
+The transaction is emitted as one unbroken base64 line, but some chat clients
+insert line breaks when a long line is copied. Strip whitespace before feeding
+it to a decoder that does not tolerate it.
+
+**Refusals that arrive without text.** The host runs a reply-intent classifier
+before the agent loop. When that classifier declines to answer, the user gets an
+emoji reaction and nothing else: 🚫 for a policy refusal, 👍 for a request the
+host considers already answered. The reason is written to the runtime trace in
+plain language, yet it never reaches the channel. An operator who needs every
+request acknowledged in text can bypass the classifier with
+
+```toml
+[agents.<name>.precheck]
+enabled = false
+```
+
+which routes every accepted message through the full agent loop. Note the trade:
+that classifier is also what stops an obvious injection before it reaches the
+model, and the refusals in this plugin hold regardless of either setting, since
+they are enforced against the operator's allowlist rather than by prompt.

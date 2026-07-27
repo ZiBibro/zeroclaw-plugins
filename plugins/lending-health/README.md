@@ -230,3 +230,39 @@ the operator's config has no path to a request. Even if the model fully complied
 with the injection and passed the attacker's pubkey, the tool physically cannot
 query it. The failure is closed, and the error names only the labels the
 operator actually configured.
+
+## Operating notes
+
+Both of these surfaced while driving the plugin through a real Telegram channel,
+and neither is visible from reading the code.
+
+**Addresses can come back redacted.** The host scans outbound channel messages
+for leaked credentials and replaces high-entropy tokens with
+`[REDACTED_HIGH_ENTROPY_TOKEN]`. A Solana pubkey trips that heuristic, so a
+refusal that names an address arrives with the address blanked out. Set
+
+```toml
+[security.leak_detection]
+high_entropy_tokens = false
+```
+
+to switch off the entropy heuristic while the deterministic patterns for real
+credentials keep running: Anthropic, OpenAI, GitHub, Stripe, Google and Groq
+keys are all still redacted. This report contains public chain data and operator
+labels, never key material.
+
+**Refusals that arrive without text.** The host runs a reply-intent classifier
+before the agent loop. When that classifier declines to answer, the user gets an
+emoji reaction and nothing else: 🚫 for a policy refusal, 👍 for a request the
+host considers already answered. The reason is written to the runtime trace in
+plain language, yet it never reaches the channel. An operator who needs every
+request acknowledged in text can bypass the classifier with
+
+```toml
+[agents.<name>.precheck]
+enabled = false
+```
+
+which routes every accepted message through the full agent loop. The refusals in
+this plugin hold under either setting, since they are enforced against the
+operator's allowlist rather than by prompt.
