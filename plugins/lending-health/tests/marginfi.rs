@@ -127,8 +127,16 @@ fn synthetic_maintenance_fixture_reports_a_distance() {
 fn synthetic_maintenance_fixture_renders_a_measured_line() {
     let positions = parse_gpa_response(GPA_MAINT_SYNTHETIC, "main").unwrap();
     let report = render_report(&positions, &config());
+    // The dollar figures are unweighted: 700/1000 is 70%, not the 75% printed
+    // beside them. Both numbers are right on their own basis, so the line says
+    // which basis the percentage uses rather than looking like a defect.
+    // MarginFi liquidates when the maintenance-weighted ratio reaches 1.0, so
+    // 75% of that line leaves a quarter of the distance unused and does not
+    // warrant a flag. Under the earlier flat thresholds this printed WARN, which
+    // is what a 25-point cushion looked like when the position's own line was
+    // never consulted.
     assert!(
-        report.contains("[WARN] main marginfi acct #8mmH..WD56: deposit $1000, borrow $700, LTV 75.0% of 100.0% liq"),
+        report.contains("[OK] main marginfi acct #8mmH..WD56: deposit $1000, borrow $700, maint LTV 75.0% of 100.0% liq"),
         "report: {report}"
     );
 }
@@ -186,7 +194,7 @@ fn unhealthy_flag_keeps_the_measured_ratio_and_condemns_the_line() {
     assert!(
         report.contains(
             "[CRITICAL] main marginfi acct #pubkey: \
-             deposit $1000, borrow $700, LTV 75.0% of 100.0% liq (flagged unhealthy)"
+             deposit $1000, borrow $700, maint LTV 75.0% of 100.0% liq (flagged unhealthy)"
         ),
         "report: {report}"
     );

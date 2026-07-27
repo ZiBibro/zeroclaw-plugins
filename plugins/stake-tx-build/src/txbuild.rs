@@ -192,7 +192,7 @@ impl Config {
             .ok_or("config key `authority` is required: the fee payer and stake authority pubkey (never a private key)")?
             .trim()
             .to_string();
-        validate_pubkey(&authority)?;
+        validate_pubkey(&authority, "config key `authority`")?;
 
         let rpc_url = section
             .get("rpc_url")
@@ -221,8 +221,8 @@ impl Config {
             (Some(account), Some(authority)) => {
                 let account = account.trim().to_string();
                 let authority = authority.trim().to_string();
-                validate_pubkey(&account)?;
-                validate_pubkey(&authority)?;
+                validate_pubkey(&account, "config key `nonce_account`")?;
+                validate_pubkey(&authority, "config key `nonce_authority`")?;
                 Some(NoncePair { account, authority })
             }
             _ => {
@@ -261,6 +261,7 @@ impl Config {
     /// model can only pick a configured account, never introduce a new one.
     pub fn resolve_stake(&self, requested: &str) -> Result<&StakeAccountRef, String> {
         let q = requested.trim();
+        reject_invisible(q, "requested stake account")?;
         self.accounts
             .iter()
             .find(|a| a.label == q || a.pubkey == q)
@@ -289,7 +290,18 @@ fn parse_accounts(raw: &str) -> Result<Vec<StakeAccountRef>, String> {
             Some((l, p)) => (l.trim().to_string(), p.trim().to_string()),
             None => (format!("stake{}", i + 1), entry.to_string()),
         };
-        validate_pubkey(&pubkey)?;
+        reject_invisible(&label, "stake account label")?;
+        validate_pubkey(&pubkey, &format!("stake_accounts entry `{label}`"))?;
+        // `resolve_stake` accepts a label or a pubkey in one namespace, so a
+        // label that is itself a valid address would shadow the entry that
+        // actually holds that address: asking for the shadowed account would
+        // silently build against a different one. Refusing the ambiguity at
+        // parse time keeps the lookup unambiguous by construction.
+        if validate_pubkey(&label, "label").is_ok() {
+            return Err(format!(
+                "stake account label `{label}` is itself a valid pubkey, which would shadow the entry holding that address; use a name instead"
+            ));
+        }
         if out.iter().any(|a: &StakeAccountRef| a.label == label) {
             return Err(format!("duplicate stake account label `{label}`"));
         }
@@ -304,7 +316,7 @@ fn parse_accounts(raw: &str) -> Result<Vec<StakeAccountRef>, String> {
 fn parse_vote_allowlist(raw: &str) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
     for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        validate_pubkey(entry)?;
+        validate_pubkey(entry, "allowed_vote_accounts entry")?;
         if out.iter().any(|v| v == entry) {
             return Err(format!(
                 "duplicate vote account `{entry}` in allowed_vote_accounts"
@@ -315,13 +327,47 @@ fn parse_vote_allowlist(raw: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-pub fn validate_pubkey(candidate: &str) -> Result<(), String> {
+/// Rejects values carrying characters that leave no visible trace: control
+/// codes, zero-width marks, the soft hyphen and the BOM.
+///
+/// Without this check `main` and a `main` with a trailing zero-width space
+/// render identically, so a refusal reads "`main` is not in the allowlist;
+/// known labels: main" and the operator has no way to see the difference
+/// between the value they typed and the one that was accepted. The worst case
+/// is an invisible byte inside the config itself, where the label can never be
+/// typed to match and the plugin is stuck for good. `trim` does not help: NBSP
+/// it removes, these it does not.
+fn reject_invisible(value: &str, what: &str) -> Result<(), String> {
+    for (i, ch) in value.char_indices() {
+        let invisible = ch.is_control()
+            || matches!(
+                ch,
+                '\u{00ad}' | '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}'
+            );
+        if invisible {
+            return Err(format!(
+                "{what} contains an invisible character (U+{:04X}) at byte {i}, so it would look identical to a clean value; retype it without hidden formatting",
+                ch as u32
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_pubkey(candidate: &str, what: &str) -> Result<(), String> {
+    // `what` names the config key or entry under inspection. Without it an
+    // empty or malformed value produced "`` is not a valid Solana pubkey",
+    // leaving the operator to guess which of the several pubkey-bearing keys
+    // was the broken one.
+    if candidate.is_empty() {
+        return Err(format!("{what} is empty; expected a base58 Solana pubkey"));
+    }
     let bytes = bs58::decode(candidate)
         .into_vec()
-        .map_err(|_| format!("`{candidate}` is not valid base58"))?;
+        .map_err(|_| format!("{what}: `{candidate}` is not valid base58"))?;
     if bytes.len() != 32 {
         return Err(format!(
-            "`{candidate}` is not a valid Solana pubkey (decoded {} bytes, expected 32)",
+            "{what}: `{candidate}` is not a valid Solana pubkey (decoded {} bytes, expected 32)",
             bytes.len()
         ));
     }
@@ -453,7 +499,7 @@ fn rpc_result(body: &str) -> Result<Value, String> {
 pub fn parse_genesis_hash(body: &str) -> Result<String, String> {
     let r = rpc_result(body)?;
     let hash = r.as_str().ok_or("getGenesisHash reply has no hash")?.trim();
-    validate_pubkey(hash)
+    validate_pubkey(hash, "genesis hash")
         .map_err(|_| format!("genesis hash `{hash}` is not 32 bytes of base58"))?;
     Ok(hash.to_string())
 }
@@ -468,11 +514,32 @@ pub fn parse_latest_blockhash(body: &str) -> Result<[u8; 32], String> {
     decode_pubkey(hash).map_err(|_| format!("blockhash `{hash}` is not 32 bytes of base58"))
 }
 
+/// Layout of a nonce account, per `NonceAccountLayout` in solana-web3.js and
+/// `nonce::state` in solana-sdk: version tag `u32` at 0..4, state tag `u32` at
+/// 4..8, authority at 8..40, the durable nonce at 40..72, and the fee calculator
+/// at 72..80.
+const NONCE_ACCOUNT_LEN: usize = 80;
+/// `Versions::Current`. `Versions::Legacy` is tag 0, and solana-sdk's
+/// `verify_recent_blockhash` refuses it outright: "Legacy durable nonces are
+/// invalid and should not allow durable transactions."
+const NONCE_VERSION_CURRENT: u32 = 1;
+/// `State::Initialized`. Tag 0 is `State::Uninitialized`, which the runtime also
+/// refuses, and whose nonce field is 32 zero bytes.
+const NONCE_STATE_INITIALIZED: u32 = 1;
+
+fn le_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
 /// Extracts the durable blockhash from a nonce account read with
-/// `getAccountInfo` (encoding base64). The account data is a
-/// `solana-program::nonce::state::Versions`: a 4-byte version tag, a 4-byte
-/// state tag, the 32-byte nonce authority at bytes 8..40, then the durable
-/// blockhash at bytes 40..72, which is the field this reads.
+/// `getAccountInfo` (encoding base64).
+///
+/// Both tags are checked before the nonce field is trusted. An account that was
+/// allocated and assigned to the System program but never initialized carries
+/// state tag 0 and a nonce field of 32 zero bytes; reading it blindly produces a
+/// transaction that no validator will ever accept, and the failure surfaces only
+/// after a human has signed. A legacy-version account is refused for the same
+/// reason the runtime refuses it.
 pub fn parse_nonce_blockhash(body: &str) -> Result<[u8; 32], String> {
     let r = rpc_result(body)?;
     let value = r
@@ -494,14 +561,33 @@ pub fn parse_nonce_blockhash(body: &str) -> Result<[u8; 32], String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|e| format!("nonce account data is not valid base64: {e}"))?;
-    if bytes.len() < 72 {
+    if bytes.len() < NONCE_ACCOUNT_LEN {
         return Err(format!(
-            "nonce account data is {} bytes, expected at least 72",
+            "nonce account data is {} bytes, expected at least {NONCE_ACCOUNT_LEN}: this is not a nonce account",
             bytes.len()
+        ));
+    }
+    let version = le_u32(&bytes[0..4]);
+    if version != NONCE_VERSION_CURRENT {
+        return Err(format!(
+            "nonce account carries version tag {version}, expected {NONCE_VERSION_CURRENT}: a legacy nonce cannot authorize a durable transaction"
+        ));
+    }
+    let state = le_u32(&bytes[4..8]);
+    if state != NONCE_STATE_INITIALIZED {
+        return Err(format!(
+            "nonce account is not initialized (state tag {state}): run InitializeNonceAccount before using it as a durable nonce"
         ));
     }
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&bytes[40..72]);
+    // An initialized account cannot hold a zeroed nonce, so this is a
+    // belt-and-braces refusal against a shape the tags said was valid.
+    if hash == [0u8; 32] {
+        return Err(
+            "nonce account reports initialized but holds an all-zero nonce; refusing to build a transaction that cannot land".to_string(),
+        );
+    }
     Ok(hash)
 }
 
@@ -887,22 +973,37 @@ pub fn build_transaction(
     let tx_bytes = serialize_transaction(message.num_required_signatures, &message_bytes);
     let tx_base64 = base64::engine::general_purpose::STANDARD.encode(tx_bytes);
 
-    let target = match &voter {
-        Some(v) => format!(" to vote account {v}"),
-        None => String::new(),
-    };
-    let lifetime = if cfg.nonce.is_some() {
-        "durable nonce: stays valid until the nonce advances, so it can wait in an approval queue"
-    } else {
-        "fresh blockhash: sign and submit within roughly 60 to 90 seconds"
-    };
-    let summary = format!(
-        "Unsigned {} transaction for stake `{}`{}; amount not read by this builder; {}.",
+    // The summary is what a human reads before signing, so it names the
+    // addresses that are actually encoded in the bytes above. Naming only the
+    // config label would ask the operator to approve `main` while the signature
+    // covers whatever pubkey that label happens to point at: a mislabeled entry
+    // would then be confirmed, not caught. Addresses are given in full because
+    // the operator's job here is to compare them against what they expect, and a
+    // truncated address can be ground out to collide on its visible ends.
+    // Kept to a single line: `output()` puts the summary on line one and the
+    // base64 on line two, and callers split on that.
+    let mut summary = format!(
+        "Unsigned {} transaction, verify each address before signing: stake account {} (config label `{}`), fee payer and sole signer {}",
         action.as_str(),
+        stake.pubkey,
         stake.label,
-        target,
-        lifetime
+        cfg.authority,
     );
+    if let Some(v) = &voter {
+        summary.push_str(&format!(", vote account {v}"));
+    }
+    if let Some(nonce) = &cfg.nonce {
+        summary.push_str(&format!(
+            ", nonce account {} (authority {})",
+            nonce.account, nonce.authority
+        ));
+    }
+    summary.push_str(if cfg.nonce.is_some() {
+        "; lifetime: durable nonce, stays valid until the nonce advances, so it can wait in an approval queue"
+    } else {
+        "; lifetime: fresh blockhash, sign and submit within roughly 60 to 90 seconds"
+    });
+    summary.push_str("; amount: not read by this builder.");
 
     Ok(Built { summary, tx_base64 })
 }

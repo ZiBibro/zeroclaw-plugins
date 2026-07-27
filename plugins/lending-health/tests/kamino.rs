@@ -92,3 +92,62 @@ fn iso_parser_matches_known_epochs() {
     assert_eq!(b - a, 140_971);
     assert_eq!(iso_to_epoch("garbage"), None);
 }
+
+/// The portfolio endpoint returned decimal strings when the fixtures were
+/// captured, but the encoding is upstream's to change. A JSON number must read
+/// the same way, because the alternative is a position that silently disappears
+/// the day Kamino switches.
+#[test]
+fn a_numeric_ratio_reads_the_same_as_a_decimal_string() {
+    let body = ACTIVE.replace(
+        "\"ltv\":\"0.62385441527566678867\"",
+        "\"ltv\":0.62385441527566678867",
+    );
+    assert!(
+        body.contains("\"ltv\":0.6238"),
+        "fixture shape changed, update this test"
+    );
+    let positions = parse_portfolio(&body, "main").expect("numeric ratio");
+    let with_basis = positions
+        .iter()
+        .find(|p| {
+            p.liquidation
+                .is_some_and(|l| (l.ltv - 0.623_854).abs() < 1e-5)
+        })
+        .expect("the numeric ltv row is still parsed with its basis");
+    assert!(with_basis.deposit_usd > 0.0);
+}
+
+/// Losing the ratio pair costs the liquidation distance for one position. It must
+/// never cost the position, because a dropped row makes the report assert the
+/// wallet holds nothing while a real borrow sits on chain.
+#[test]
+fn a_row_without_a_ratio_pair_survives_without_its_basis() {
+    let body = ACTIVE
+        .replace("\"ltv\":\"0.62385441527566678867\"", "\"ltv\":null")
+        .replace(
+            "\"liquidationLtv\":\"0.75000000000000000002\"",
+            "\"liquidationLtv\":null",
+        );
+    assert!(
+        body.contains("\"ltv\":null"),
+        "fixture shape changed, update this test"
+    );
+    let before = parse_portfolio(ACTIVE, "main").expect("baseline");
+    let after = parse_portfolio(&body, "main").expect("ratio-less row");
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "the row must still be reported, without a measured distance"
+    );
+    assert!(
+        after.iter().any(|p| p.liquidation.is_none()),
+        "the ratio-less row must carry no basis"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|p| p.deposit_usd > 0.0 && p.liquidation.is_none()),
+        "its deposit figure is still known and must survive"
+    );
+}

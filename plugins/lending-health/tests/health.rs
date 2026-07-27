@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use lending_health::health::{
-    classify, classify_position, render_payload, render_report, render_total_failure,
-    short_account, validate_pubkey, Config, Liquidation, Position, Protocol, Risk, REPORT_CHAR_CAP,
+    classify, classify_position, liquidation_buffer, render_payload, render_report,
+    render_total_failure, short_account, validate_pubkey, Config, Liquidation, Position, Protocol,
+    Risk, REPORT_CHAR_CAP,
 };
 
 const WALLET_A: &str = "86xCnPeV69n6t3DnyGvkKobf9FdN2H9oiVDdaMpo2MMY";
@@ -29,7 +30,7 @@ fn config_parses_minimal_valid_section() {
     assert_eq!(cfg.wallets[0].label, "main");
     assert_eq!(cfg.wallets[0].pubkey, WALLET_A);
     assert_eq!(cfg.protocols, vec![Protocol::Kamino, Protocol::Marginfi]);
-    assert!(cfg.warn_ltv < cfg.critical_ltv);
+    assert!(cfg.warn_liquidation_buffer > cfg.critical_liquidation_buffer);
 }
 
 #[test]
@@ -112,15 +113,21 @@ fn config_rejects_unknown_protocol() {
 #[test]
 fn config_rejects_inverted_thresholds() {
     let mut s = base_section();
-    s.insert("warn_ltv".to_string(), "0.9".to_string());
-    s.insert("critical_ltv".to_string(), "0.8".to_string());
-    assert!(Config::from_section(&s).is_err());
+    // Inverted on the buffer basis: a warning at 0.05 would fire later than a
+    // critical at 0.20, which is the wrong way round.
+    s.insert("warn_liquidation_buffer".to_string(), "0.05".to_string());
+    s.insert(
+        "critical_liquidation_buffer".to_string(),
+        "0.20".to_string(),
+    );
+    let err = Config::from_section(&s).unwrap_err();
+    assert!(err.contains("must be above"), "err: {err}");
 }
 
 #[test]
 fn config_rejects_out_of_range_ratio() {
     let mut s = base_section();
-    s.insert("warn_ltv".to_string(), "1.5".to_string());
+    s.insert("warn_liquidation_buffer".to_string(), "1.5".to_string());
     assert!(Config::from_section(&s).is_err());
 }
 
@@ -144,16 +151,71 @@ fn resolve_wallet_finds_by_label_and_pubkey() {
 
 #[test]
 fn pubkey_validation_rejects_wrong_length() {
-    assert!(validate_pubkey("abc").is_err());
-    assert!(validate_pubkey(WALLET_A).is_ok());
+    assert!(validate_pubkey("abc", "test key").is_err());
+    assert!(validate_pubkey(WALLET_A, "test key").is_ok());
+}
+
+fn liq(ltv: f64, liquidation_ltv: f64) -> Liquidation {
+    Liquidation {
+        ltv,
+        liquidation_ltv,
+    }
 }
 
 #[test]
-fn classify_uses_configured_thresholds() {
+fn classify_measures_the_liquidation_buffer_kamino_documents() {
     let cfg = Config::from_section(&base_section()).unwrap();
-    assert_eq!(classify(0.10, &cfg), Risk::Ok);
-    assert_eq!(classify(0.65, &cfg), Risk::Warn);
-    assert_eq!(classify(0.80, &cfg), Risk::Critical);
+    // Defaults flag at a 0.15 buffer and escalate at 0.05.
+    // (0.80 - 0.40) / 0.80 = 0.50 of the collateral value may still be lost.
+    assert_eq!(classify(liq(0.40, 0.80), &cfg), Risk::Ok);
+    // (0.80 - 0.70) / 0.80 = 0.125 left, inside the warning band.
+    assert_eq!(classify(liq(0.70, 0.80), &cfg), Risk::Warn);
+    // (0.80 - 0.78) / 0.80 = 0.025 left.
+    assert_eq!(classify(liq(0.78, 0.80), &cfg), Risk::Critical);
+}
+
+/// The worked example from Kamino's own documentation: 70% current LTV against
+/// an 80% liquidation LTV tolerates a 12.5% decline in collateral value. Pinning
+/// it here keeps our arithmetic tied to the protocol's published formula rather
+/// than to an in-house invention.
+#[test]
+fn the_buffer_matches_the_documented_kamino_example() {
+    let buffer = liquidation_buffer(liq(0.70, 0.80)).expect("measurable");
+    assert!((buffer - 0.125).abs() < 1e-9, "buffer: {buffer}");
+}
+
+/// The defect this replaces: classification read two flat config numbers and
+/// ignored the `liquidation_ltv` sitting in the same struct, so the same LTV got
+/// the same verdict in markets whose lines are 12 points apart.
+#[test]
+fn the_same_ltv_is_judged_against_each_market_own_line() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    // 82% with a 95% line leaves a 13.7% buffer: worth a flag, not an alarm.
+    assert_eq!(classify(liq(0.82, 0.95), &cfg), Risk::Warn);
+    // The same 82% against an 83% line leaves 1.2%.
+    assert_eq!(classify(liq(0.82, 0.83), &cfg), Risk::Critical);
+}
+
+/// A position the protocol can already seize has no buffer left to spend.
+#[test]
+fn a_position_at_or_past_its_line_is_critical() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    assert_eq!(classify(liq(0.90, 0.90), &cfg), Risk::Critical);
+    assert_eq!(classify(liq(0.95, 0.90), &cfg), Risk::Critical);
+    let past = liquidation_buffer(liq(0.95, 0.90)).expect("measurable");
+    assert!(past < 0.0, "buffer past the line must be negative: {past}");
+}
+
+/// A line of zero, or a ratio that is not a number, measures nothing. Reporting
+/// either as OK would clear a position on arithmetic that never happened, and
+/// reporting it as CRITICAL would condemn one on the same absence.
+#[test]
+fn an_unmeasurable_basis_stays_unknown() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    assert_eq!(classify(liq(0.50, 0.0), &cfg), Risk::Unknown);
+    assert_eq!(classify(liq(0.50, -0.10), &cfg), Risk::Unknown);
+    assert_eq!(classify(liq(f64::NAN, 0.80), &cfg), Risk::Unknown);
+    assert_eq!(classify(liq(f64::INFINITY, 0.80), &cfg), Risk::Unknown);
 }
 
 fn position(label: &str, market: &str, ltv: f64) -> Position {
@@ -194,7 +256,8 @@ fn short_account_keeps_head_and_tail() {
 #[test]
 fn classify_position_marks_missing_basis_unknown() {
     let cfg = Config::from_section(&base_section()).unwrap();
-    let measured = position("main", "usdc", 0.70);
+    // 0.75 against the helper's 0.85 line is 88% of the distance, so it warns.
+    let measured = position("main", "usdc", 0.75);
     assert_eq!(classify_position(&measured, &cfg), Risk::Warn);
     let mut blind = measured.clone();
     blind.liquidation = None;
@@ -286,7 +349,7 @@ fn unknown_basis_outranks_calm_but_not_measured_risk() {
     let positions = vec![
         position("main", "calm", 0.10),
         blind,
-        position("main", "warm", 0.70),
+        position("main", "warm", 0.75),
     ];
     let report = render_report(&positions, &cfg);
     let warm = report.find("warm").unwrap();
@@ -430,4 +493,53 @@ fn total_failure_text_states_a_single_short_issue_in_full() {
         render_total_failure(&issues),
         "every data source failed: kamino main: http 503"
     );
+}
+
+/// The two protocols measure LTV on different bases and share one column, while
+/// the dollar amounts beside them are unweighted in both cases. A MarginFi line
+/// showing $5,000 deposit, $10,000 borrow and 75% invites the operator to divide
+/// and conclude the tool is broken. The percentage is right on its own basis, so
+/// the line names the basis.
+#[test]
+fn a_marginfi_ltv_says_it_is_maintenance_weighted() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let mfi = Position {
+        wallet_label: "main".to_string(),
+        protocol: Protocol::Marginfi,
+        market: "acct".to_string(),
+        account: "AbCd..WxYz".to_string(),
+        deposit_usd: 5_000.0,
+        borrow_usd: 10_000.0,
+        liquidation: Some(Liquidation {
+            ltv: 0.75,
+            liquidation_ltv: 1.0,
+        }),
+        flagged_unhealthy: false,
+        stale_hint: None,
+    };
+    let report = render_report(&[mfi], &cfg);
+    assert!(report.contains("maint LTV 75.0%"), "report: {report}");
+
+    // Kamino publishes a protocol LTV directly, so its line carries no prefix
+    // and stays as short as it was.
+    let kam = Position {
+        wallet_label: "main".to_string(),
+        protocol: Protocol::Kamino,
+        market: "main".to_string(),
+        account: "AbCd..WxYz".to_string(),
+        deposit_usd: 10_000.0,
+        borrow_usd: 6_630.0,
+        liquidation: Some(Liquidation {
+            ltv: 0.663,
+            liquidation_ltv: 0.799,
+        }),
+        flagged_unhealthy: false,
+        stale_hint: None,
+    };
+    let report = render_report(&[kam], &cfg);
+    assert!(
+        report.contains("LTV 66.3% of 79.9% liq"),
+        "report: {report}"
+    );
+    assert!(!report.contains("maint"), "report: {report}");
 }

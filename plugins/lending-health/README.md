@@ -22,9 +22,24 @@ Position lines carry the obligation or account address they were decoded from,
 shortened to a head and a tail, so a report covering several positions in the
 same market says which one each figure belongs to.
 
-Two thresholds split the risk scale. Below `warn_ltv` a position reads `OK`. At
-or above `warn_ltv` it reads `WARN`, and at or above `critical_ltv` it escalates
-to `CRITICAL`. The report lists one line per position, worst risk first, and the
+Risk is measured as the **liquidation buffer**, the metric Kamino documents:
+the share of collateral value that can still be lost before the position becomes
+liquidatable.
+
+    buffer = (liquidation LTV - current LTV) / liquidation LTV
+
+Kamino's own worked example: 70% current LTV against an 80% liquidation LTV
+tolerates a 12.5% decline. Thresholds are set on this basis rather than on raw
+LTV because every market carries its own liquidation line. A flat 0.65 cutoff
+would condemn a position with thirty points of headroom and clear one a tick from
+seizure. A position at or past its line has no buffer left and always reads
+`CRITICAL`.
+
+At or below `warn_liquidation_buffer` a position reads `WARN`; at or below
+`critical_liquidation_buffer` it escalates to `CRITICAL`. The defaults follow the
+buffer ranges Kamino publishes for its markets, where major liquid assets carry
+five to ten points between LTV and liquidation threshold and long-tail assets ten
+to twenty. The report lists one line per position, worst risk first, and the
 whole thing is capped near 200 tokens so a recurring briefing never floods the
 agent context. Positions that the Kamino indexer has not refreshed against the
 current price feed carry a staleness hint, so an old snapshot is never presented
@@ -72,9 +87,19 @@ section.
 | `rpc_url` | (none) | Solana JSON-RPC endpoint used for the MarginFi read. Required whenever `marginfi` is enabled. Must be `https://`. |
 | `kamino_api_base` | `https://api.kamino.finance` | Base URL for the Kamino REST API. Must be `https://`. |
 | `protocols` | `kamino,marginfi` | Which protocols to query. |
-| `warn_ltv` | `0.65` | LTV at or above which a position is flagged `WARN`. |
-| `critical_ltv` | `0.80` | LTV at or above which a position is flagged `CRITICAL`. Must exceed `warn_ltv`. |
+| `warn_liquidation_buffer` | `0.15` | Liquidation buffer at or below which a position is flagged `WARN`. |
+| `critical_liquidation_buffer` | `0.05` | Liquidation buffer at or below which a position is flagged `CRITICAL`. Must be below `warn_liquidation_buffer`: a warning fires while more of the buffer remains. |
 | `timeout_secs` | `10` | Per-request connect timeout in seconds, bounded to 1 through 60. |
+
+Kamino and MarginFi measure LTV on different bases, and both land in the same
+column. Kamino publishes a protocol LTV: risk-adjusted debt over collateral,
+against a per-reserve liquidation threshold. MarginFi has no equivalent figure,
+so its ratio is maintenance-weighted liabilities over maintenance-weighted
+assets, liquidatable at 1.0, and its lines are prefixed `maint LTV`. The dollar
+amounts printed beside the ratio are unweighted for both protocols, so a MarginFi
+line can show $1,000 deposit, $700 borrow and `maint LTV 75.0%` without
+contradicting itself. The buffer normalizes the two bases, which is why one
+threshold pair governs both.
 
 ## Layout (the reference format)
 

@@ -22,8 +22,24 @@ const OMISSION_LINE_RESERVE: usize = 40;
 const OMISSION_MARKER_RESERVE: usize = 16;
 
 pub const DEFAULT_KAMINO_API_BASE: &str = "https://api.kamino.finance";
-pub const DEFAULT_WARN_LTV: f64 = 0.65;
-pub const DEFAULT_CRITICAL_LTV: f64 = 0.80;
+/// Liquidation buffer, as Kamino defines it: the share of the gap between
+/// Current LTV and Liquidation LTV that is still unused, i.e. how far the
+/// collateral can fall before the position becomes liquidatable.
+///
+/// `buffer = (liquidation_ltv - ltv) / liquidation_ltv`
+///
+/// Kamino's own documentation calls this the tolerable decline and states that
+/// the buffer which matters is the gap to Liquidation LTV rather than the gap to
+/// Max LTV. Thresholds are expressed on this basis because every market and
+/// every obligation carries its own liquidation line: a flat 0.65 on raw LTV
+/// would condemn a position with 30 points of headroom and clear one a tick from
+/// seizure.
+///
+/// Defaults follow the buffer ranges Kamino publishes for its markets: major
+/// liquid assets carry a 5 to 10 point buffer between LTV and liquidation
+/// threshold, long-tail assets 10 to 20.
+pub const DEFAULT_WARN_LIQUIDATION_BUFFER: f64 = 0.15;
+pub const DEFAULT_CRITICAL_LIQUIDATION_BUFFER: f64 = 0.05;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
 const CONFIG_KEYS: [&str; 7] = [
@@ -31,8 +47,8 @@ const CONFIG_KEYS: [&str; 7] = [
     "rpc_url",
     "kamino_api_base",
     "protocols",
-    "warn_ltv",
-    "critical_ltv",
+    "warn_liquidation_buffer",
+    "critical_liquidation_buffer",
     "timeout_secs",
 ];
 
@@ -55,6 +71,23 @@ impl Protocol {
             Protocol::Marginfi => "marginfi",
         }
     }
+
+    /// Prefix naming the basis of the LTV figure in a rendered line.
+    ///
+    /// Kamino publishes a protocol LTV: risk-adjusted debt over collateral,
+    /// against a per-reserve liquidation threshold. MarginFi has no equivalent
+    /// figure, so its ratio is maintenance-weighted liabilities over
+    /// maintenance-weighted assets, liquidatable at 1.0. Both land in one
+    /// column, and the dollar amounts printed beside them are unweighted in
+    /// both cases. Without a label the MarginFi line invites an operator to
+    /// divide $5,000 by $10,000, get 50%, and read the 75% next to it as a bug.
+    /// The percentage is correct on its own basis; the column now says which.
+    pub fn ltv_basis_prefix(self) -> &'static str {
+        match self {
+            Protocol::Kamino => "",
+            Protocol::Marginfi => "maint ",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -63,8 +96,10 @@ pub struct Config {
     pub rpc_url: Option<String>,
     pub kamino_api_base: String,
     pub protocols: Vec<Protocol>,
-    pub warn_ltv: f64,
-    pub critical_ltv: f64,
+    /// Liquidation buffer at or below which a position is flagged. See
+    /// [`DEFAULT_WARN_LIQUIDATION_BUFFER`] for the basis.
+    pub warn_liquidation_buffer: f64,
+    pub critical_liquidation_buffer: f64,
     pub timeout_secs: u64,
 }
 
@@ -110,15 +145,22 @@ impl Config {
             None => DEFAULT_KAMINO_API_BASE.to_string(),
         };
 
-        let warn_ltv = parse_ratio(section.get("warn_ltv"), "warn_ltv", DEFAULT_WARN_LTV)?;
-        let critical_ltv = parse_ratio(
-            section.get("critical_ltv"),
-            "critical_ltv",
-            DEFAULT_CRITICAL_LTV,
+        let warn_liquidation_buffer = parse_ratio(
+            section.get("warn_liquidation_buffer"),
+            "warn_liquidation_buffer",
+            DEFAULT_WARN_LIQUIDATION_BUFFER,
         )?;
-        if warn_ltv >= critical_ltv {
+        let critical_liquidation_buffer = parse_ratio(
+            section.get("critical_liquidation_buffer"),
+            "critical_liquidation_buffer",
+            DEFAULT_CRITICAL_LIQUIDATION_BUFFER,
+        )?;
+        // A warning must fire before the critical line, so it sits at the wider
+        // buffer. The comparison runs the opposite way to a raw-LTV threshold
+        // pair, which is why the message spells out which is which.
+        if warn_liquidation_buffer <= critical_liquidation_buffer {
             return Err(format!(
-                "warn_ltv ({warn_ltv}) must be below critical_ltv ({critical_ltv})"
+                "warn_liquidation_buffer ({warn_liquidation_buffer}) must be above critical_liquidation_buffer ({critical_liquidation_buffer}): a warning fires while more of the buffer remains"
             ));
         }
 
@@ -140,8 +182,8 @@ impl Config {
             rpc_url,
             kamino_api_base,
             protocols,
-            warn_ltv,
-            critical_ltv,
+            warn_liquidation_buffer,
+            critical_liquidation_buffer,
             timeout_secs,
         })
     }
@@ -153,6 +195,7 @@ impl Config {
             None => Ok(self.wallets.iter().collect()),
             Some(query) => {
                 let q = query.trim();
+                reject_invisible(q, "requested wallet")?;
                 let hit: Vec<&Wallet> = self
                     .wallets
                     .iter()
@@ -187,7 +230,8 @@ fn parse_wallets(raw: &str) -> Result<Vec<Wallet>, String> {
             Some((l, p)) => (l.trim().to_string(), p.trim().to_string()),
             None => (format!("wallet{}", i + 1), entry.to_string()),
         };
-        validate_pubkey(&pubkey)?;
+        reject_invisible(&label, "wallet label")?;
+        validate_pubkey(&pubkey, &format!("wallets entry `{label}`"))?;
         if out.iter().any(|w: &Wallet| w.label == label) {
             return Err(format!("duplicate wallet label `{label}`"));
         }
@@ -199,13 +243,47 @@ fn parse_wallets(raw: &str) -> Result<Vec<Wallet>, String> {
     Ok(out)
 }
 
-pub fn validate_pubkey(candidate: &str) -> Result<(), String> {
+/// Rejects values carrying characters that leave no visible trace: control
+/// codes, zero-width marks, the soft hyphen and the BOM.
+///
+/// Without this check `main` and a `main` with a trailing zero-width space
+/// render identically, so a refusal reads "`main` is not in the allowlist;
+/// known labels: main" and the operator has no way to see the difference
+/// between the value they typed and the one that was accepted. The worst case
+/// is an invisible byte inside the config itself, where the label can never be
+/// typed to match and the plugin is stuck for good. `trim` does not help: NBSP
+/// it removes, these it does not.
+fn reject_invisible(value: &str, what: &str) -> Result<(), String> {
+    for (i, ch) in value.char_indices() {
+        let invisible = ch.is_control()
+            || matches!(
+                ch,
+                '\u{00ad}' | '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}'
+            );
+        if invisible {
+            return Err(format!(
+                "{what} contains an invisible character (U+{:04X}) at byte {i}, so it would look identical to a clean value; retype it without hidden formatting",
+                ch as u32
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_pubkey(candidate: &str, what: &str) -> Result<(), String> {
+    // `what` names the config key or entry under inspection. Without it an
+    // empty or malformed value produced "`` is not a valid Solana pubkey",
+    // leaving the operator to guess which of the several pubkey-bearing keys
+    // was the broken one.
+    if candidate.is_empty() {
+        return Err(format!("{what} is empty; expected a base58 Solana pubkey"));
+    }
     let bytes = bs58::decode(candidate)
         .into_vec()
-        .map_err(|_| format!("`{candidate}` is not valid base58"))?;
+        .map_err(|_| format!("{what}: `{candidate}` is not valid base58"))?;
     if bytes.len() != 32 {
         return Err(format!(
-            "`{candidate}` is not a valid Solana pubkey (decoded {} bytes, expected 32)",
+            "{what}: `{candidate}` is not a valid Solana pubkey (decoded {} bytes, expected 32)",
             bytes.len()
         ));
     }
@@ -281,14 +359,48 @@ impl Risk {
     }
 }
 
-pub fn classify(ltv: f64, cfg: &Config) -> Risk {
-    if ltv >= cfg.critical_ltv {
+/// Risk for one measured position, judged against the liquidation line that
+/// position actually carries rather than against a flat pair of numbers. Kamino
+/// reports a different `liquidationLtv` per market and per obligation, so the
+/// same 82% LTV is comfortable at a 95% line and past saving at an 80% one.
+///
+/// A position at or beyond its own line is [`Risk::Critical`] whatever the
+/// thresholds say: the protocol can seize it now. A line of zero or a
+/// non-finite ratio measures nothing, so the position stays
+/// [`Risk::Unknown`] instead of being condemned or cleared on a meaningless
+/// number.
+pub fn classify(l: Liquidation, cfg: &Config) -> Risk {
+    let Some(buffer) = liquidation_buffer(l) else {
+        return Risk::Unknown;
+    };
+    // A position at or past its line has a buffer of zero or less, so it lands
+    // in Critical without a special case: the protocol can seize it now.
+    if buffer <= cfg.critical_liquidation_buffer {
         Risk::Critical
-    } else if ltv >= cfg.warn_ltv {
+    } else if buffer <= cfg.warn_liquidation_buffer {
         Risk::Warn
     } else {
         Risk::Ok
     }
+}
+
+/// The liquidation buffer of one position, on the basis Kamino documents:
+/// `(liquidation_ltv - ltv) / liquidation_ltv`, i.e. the share of collateral
+/// value that can still be lost before liquidation becomes possible. Negative
+/// once the position is past its line.
+///
+/// `None` when nothing can be measured: a line of zero or below is not a line,
+/// and a non-finite ratio would make every comparison meaningless. Reporting
+/// either as a number would put a figure on the operator's screen that no
+/// arithmetic produced.
+pub fn liquidation_buffer(l: Liquidation) -> Option<f64> {
+    // Spelled out rather than written as `!(liquidation_ltv > 0.0)`: NaN must
+    // fall out here, and a bare `<= 0.0` would let it through, since every
+    // comparison against NaN is false.
+    if !l.ltv.is_finite() || !l.liquidation_ltv.is_finite() || l.liquidation_ltv <= 0.0 {
+        return None;
+    }
+    Some((l.liquidation_ltv - l.ltv) / l.liquidation_ltv)
 }
 
 /// Risk for a whole position. A protocol that has already condemned the
@@ -301,7 +413,7 @@ pub fn classify_position(position: &Position, cfg: &Config) -> Risk {
         return Risk::Critical;
     }
     match position.liquidation {
-        Some(l) => classify(l.ltv, cfg),
+        Some(l) => classify(l, cfg),
         None => Risk::Unknown,
     }
 }
@@ -461,7 +573,8 @@ fn render_within(positions: &[Position], cfg: &Config, cap: usize) -> String {
             .unwrap_or_default();
         let distance = match p.liquidation {
             Some(l) => format!(
-                "LTV {:.1}% of {:.1}% liq",
+                "{}LTV {:.1}% of {:.1}% liq",
+                p.protocol.ltv_basis_prefix(),
                 l.ltv * 100.0,
                 l.liquidation_ltv * 100.0
             ),

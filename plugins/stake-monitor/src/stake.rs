@@ -141,6 +141,7 @@ impl Config {
             None => Ok(self.accounts.iter().collect()),
             Some(query) => {
                 let q = query.trim();
+                reject_invisible(q, "requested stake account")?;
                 let hit: Vec<&StakeAccountRef> = self
                     .accounts
                     .iter()
@@ -175,7 +176,8 @@ fn parse_accounts(raw: &str) -> Result<Vec<StakeAccountRef>, String> {
             Some((l, p)) => (l.trim().to_string(), p.trim().to_string()),
             None => (format!("stake{}", i + 1), entry.to_string()),
         };
-        validate_pubkey(&pubkey)?;
+        reject_invisible(&label, "stake account label")?;
+        validate_pubkey(&pubkey, &format!("stake_accounts entry `{label}`"))?;
         if out.iter().any(|a: &StakeAccountRef| a.label == label) {
             return Err(format!("duplicate stake account label `{label}`"));
         }
@@ -187,13 +189,47 @@ fn parse_accounts(raw: &str) -> Result<Vec<StakeAccountRef>, String> {
     Ok(out)
 }
 
-pub fn validate_pubkey(candidate: &str) -> Result<(), String> {
+/// Rejects values carrying characters that leave no visible trace: control
+/// codes, zero-width marks, the soft hyphen and the BOM.
+///
+/// Without this check `main` and a `main` with a trailing zero-width space
+/// render identically, so a refusal reads "`main` is not in the allowlist;
+/// known labels: main" and the operator has no way to see the difference
+/// between the value they typed and the one that was accepted. The worst case
+/// is an invisible byte inside the config itself, where the label can never be
+/// typed to match and the plugin is stuck for good. `trim` does not help: NBSP
+/// it removes, these it does not.
+fn reject_invisible(value: &str, what: &str) -> Result<(), String> {
+    for (i, ch) in value.char_indices() {
+        let invisible = ch.is_control()
+            || matches!(
+                ch,
+                '\u{00ad}' | '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}'
+            );
+        if invisible {
+            return Err(format!(
+                "{what} contains an invisible character (U+{:04X}) at byte {i}, so it would look identical to a clean value; retype it without hidden formatting",
+                ch as u32
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_pubkey(candidate: &str, what: &str) -> Result<(), String> {
+    // `what` names the config key or entry under inspection. Without it an
+    // empty or malformed value produced "`` is not a valid Solana pubkey",
+    // leaving the operator to guess which of the several pubkey-bearing keys
+    // was the broken one.
+    if candidate.is_empty() {
+        return Err(format!("{what} is empty; expected a base58 Solana pubkey"));
+    }
     let bytes = bs58::decode(candidate)
         .into_vec()
-        .map_err(|_| format!("`{candidate}` is not valid base58"))?;
+        .map_err(|_| format!("{what}: `{candidate}` is not valid base58"))?;
     if bytes.len() != 32 {
         return Err(format!(
-            "`{candidate}` is not a valid Solana pubkey (decoded {} bytes, expected 32)",
+            "{what}: `{candidate}` is not a valid Solana pubkey (decoded {} bytes, expected 32)",
             bytes.len()
         ));
     }

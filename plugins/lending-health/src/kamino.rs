@@ -53,8 +53,19 @@ fn parse_row(
     if deposit_usd == 0.0 && borrow_usd == 0.0 {
         return None;
     }
-    let ltv = str_num(row, "ltv")?;
-    let liquidation_ltv = str_num(row, "liquidationLtv")?;
+    // A missing or unreadable ratio pair costs the liquidation distance for this
+    // position, never the position itself. The deposit and borrow figures above
+    // are already known, and dropping the row would make the report state the
+    // wallet holds nothing, which is a false claim about the chain rather than a
+    // gap in it. Without the pair the line renders as UNKNOWN, the same shape a
+    // MarginFi account with no maintenance basis takes.
+    let liquidation = match (str_num(row, "ltv"), str_num(row, "liquidationLtv")) {
+        (Some(ltv), Some(liquidation_ltv)) => Some(Liquidation {
+            ltv,
+            liquidation_ltv,
+        }),
+        _ => None,
+    };
 
     let tag = row.get("tag").and_then(Value::as_str).unwrap_or(product);
     let market = row
@@ -77,10 +88,7 @@ fn parse_row(
         account,
         deposit_usd,
         borrow_usd,
-        liquidation: Some(Liquidation {
-            ltv,
-            liquidation_ltv,
-        }),
+        liquidation,
         // The portfolio response carries no protocol-side liquidatable flag;
         // the ratio it does carry is the whole verdict here.
         flagged_unhealthy: false,
@@ -88,9 +96,17 @@ fn parse_row(
     })
 }
 
-/// Portfolio numbers are decimal strings like `"0.62385441527566678867"`.
+/// Portfolio numbers arrive as decimal strings like
+/// `"0.62385441527566678867"`, which is what this endpoint returned when the
+/// fixtures were captured. A JSON number is accepted too: the encoding is the
+/// upstream's choice, and reading only one of the two forms would turn a
+/// serialization change into silently dropped positions.
 fn str_num(row: &Value, key: &str) -> Option<f64> {
-    row.get(key)?.as_str()?.trim().parse::<f64>().ok()
+    let value = row.get(key)?;
+    if let Some(text) = value.as_str() {
+        return text.trim().parse::<f64>().ok();
+    }
+    value.as_f64()
 }
 
 fn short_pubkey(pk: &str) -> String {

@@ -289,10 +289,18 @@ fn latest_blockhash_parses_live_shape() {
 }
 
 fn nonce_body_with_hash(hash: &[u8; 32], owner: &str) -> String {
-    // Nonce state layout per `solana-program::nonce::state::Versions`:
-    // 4-byte version tag, 4-byte state tag, 32-byte authority, then the
-    // durable blockhash at offset 40.
+    nonce_body_with_tags(hash, owner, 1, 1)
+}
+
+/// Builds a nonce account reply with explicit tags. Layout per
+/// `NonceAccountLayout` in solana-web3.js and `nonce::state` in solana-sdk:
+/// version `u32` at 0..4, state `u32` at 4..8, authority at 8..40, durable nonce
+/// at 40..72, fee calculator at 72..80. A live initialized account carries
+/// version 1 (`Versions::Current`) and state 1 (`State::Initialized`).
+fn nonce_body_with_tags(hash: &[u8; 32], owner: &str, version: u32, state: u32) -> String {
     let mut data = vec![0u8; 80];
+    data[0..4].copy_from_slice(&version.to_le_bytes());
+    data[4..8].copy_from_slice(&state.to_le_bytes());
     data[40..72].copy_from_slice(hash);
     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
     format!(
@@ -641,12 +649,14 @@ fn deactivate_builds_expected_wire_transaction() {
     assert_eq!(resolved[1], decode_pubkey(SYSVAR_CLOCK_ID).unwrap());
     assert_eq!(resolved[2], decode_pubkey(AUTHORITY).unwrap());
 
-    // Summary line: action and label present, no invented amount, fresh
-    // blockhash warning present.
+    // Summary: action, the real addresses that went into the bytes, no invented
+    // amount, fresh blockhash warning present.
     assert!(built.summary.contains("deactivate"), "{}", built.summary);
     assert!(built.summary.contains("`main`"), "{}", built.summary);
+    assert!(built.summary.contains(STAKE_ACC), "{}", built.summary);
+    assert!(built.summary.contains(AUTHORITY), "{}", built.summary);
     assert!(
-        built.summary.contains("amount not read"),
+        built.summary.contains("amount: not read"),
         "{}",
         built.summary
     );
@@ -809,4 +819,151 @@ fn build_transaction_end_to_end_via_refs() {
     assert_eq!(tx.instructions.len(), 2);
     assert_eq!(tx.instructions[0].2, vec![4u8, 0, 0, 0]);
     assert_eq!(tx.instructions[1].2, vec![2u8, 0, 0, 0]);
+}
+
+/// An account allocated and assigned to the System program but never passed to
+/// InitializeNonceAccount carries state tag 0 and a nonce field of 32 zero
+/// bytes. Reading it blindly produced a transaction whose recent_blockhash slot
+/// was zeroed, advertised as valid until the nonce advances, and rejected by
+/// every validator. The failure surfaced only after a human signed it.
+#[test]
+fn an_uninitialized_nonce_account_is_refused() {
+    let body = nonce_body_with_tags(&[0u8; 32], SYSTEM_PROGRAM_ID, 1, 0);
+    let err = parse_nonce_blockhash(&body).unwrap_err();
+    assert!(err.contains("not initialized"), "err: {err}");
+    assert!(err.contains("InitializeNonceAccount"), "err: {err}");
+}
+
+/// solana-sdk's `verify_recent_blockhash` refuses `Versions::Legacy` outright:
+/// "Legacy durable nonces are invalid and should not allow durable
+/// transactions." Building against one would produce a transaction the runtime
+/// declines for the same reason.
+#[test]
+fn a_legacy_version_nonce_account_is_refused() {
+    let hash: [u8; 32] = core::array::from_fn(|i| (i as u8) + 1);
+    let body = nonce_body_with_tags(&hash, SYSTEM_PROGRAM_ID, 0, 1);
+    let err = parse_nonce_blockhash(&body).unwrap_err();
+    assert!(err.contains("version tag 0"), "err: {err}");
+}
+
+/// Arbitrary System-owned bytes can carry tags that pass while the nonce field
+/// stays zeroed. An initialized account cannot hold a zero nonce, so the shape is
+/// refused rather than encoded into a transaction that cannot land.
+#[test]
+fn an_all_zero_nonce_is_refused_even_with_valid_tags() {
+    let body = nonce_body_with_tags(&[0u8; 32], SYSTEM_PROGRAM_ID, 1, 1);
+    let err = parse_nonce_blockhash(&body).unwrap_err();
+    assert!(err.contains("all-zero nonce"), "err: {err}");
+}
+
+/// The summary is the last thing a human reads before signing. Naming only the
+/// config label would ask them to approve `main` while the signature covers
+/// whatever pubkey that label points at, so a mislabeled config entry would be
+/// confirmed rather than caught. Every address in the bytes must appear.
+#[test]
+fn the_summary_names_the_addresses_that_are_actually_signed() {
+    let cfg = durable_config();
+    let stake = cfg.resolve_stake("main").unwrap();
+    let built = build_transaction(
+        &cfg,
+        Action::Delegate,
+        stake,
+        Some(VOTE_ACC),
+        blockhash_bytes(),
+    )
+    .unwrap();
+
+    for (what, addr) in [
+        ("stake account", STAKE_ACC),
+        ("fee payer", AUTHORITY),
+        ("vote account", VOTE_ACC),
+        ("nonce account", NONCE_ACC),
+    ] {
+        assert!(
+            built.summary.contains(addr),
+            "summary omits the {what} address {addr}: {}",
+            built.summary
+        );
+    }
+    // The label stays, as a convenience, alongside the address it resolved to.
+    assert!(built.summary.contains("`main`"), "{}", built.summary);
+}
+
+/// `resolve_stake` matches a label or a pubkey in one namespace, so a label that
+/// is itself a valid address would shadow the entry actually holding it: asking
+/// for the shadowed account would silently build against a different one. The
+/// ambiguity is refused when the config is parsed.
+#[test]
+fn a_label_that_is_itself_a_pubkey_is_refused() {
+    let mut s = base_section();
+    s.insert(
+        "stake_accounts".to_string(),
+        format!("{VOTE_ACC}:{STAKE_ACC},main:{VOTE_ACC}"),
+    );
+    let err = Config::from_section(&s).unwrap_err();
+    assert!(err.contains("is itself a valid pubkey"), "err: {err}");
+}
+
+/// A zero-width space makes the rejected value and the accepted one render
+/// identically, so the refusal reads as nonsense: "`main` is not in the
+/// allowlist; known labels: main".
+#[test]
+fn an_invisible_character_is_named_rather_than_silently_mismatched() {
+    let cfg = base_config();
+    let err = cfg.resolve_stake("main\u{200b}").unwrap_err();
+    assert!(err.contains("invisible character"), "err: {err}");
+    assert!(err.contains("U+200B"), "err: {err}");
+
+    // Worst case: the invisible byte sits in the config, where the label could
+    // never be typed to match and the plugin would be stuck for good.
+    let mut s = base_section();
+    s.insert(
+        "stake_accounts".to_string(),
+        format!("ma\u{200b}in:{STAKE_ACC}"),
+    );
+    let err = Config::from_section(&s).unwrap_err();
+    assert!(err.contains("invisible character"), "err: {err}");
+}
+
+/// An empty or malformed pubkey used to report "`` is not a valid Solana
+/// pubkey", leaving the operator to guess which of the pubkey-bearing keys was
+/// broken.
+#[test]
+fn a_broken_pubkey_names_the_config_key_it_came_from() {
+    let mut s = base_section();
+    s.insert("authority".to_string(), String::new());
+    let err = Config::from_section(&s).unwrap_err();
+    assert!(err.contains("config key `authority`"), "err: {err}");
+    assert!(err.contains("empty"), "err: {err}");
+
+    let mut s = base_section();
+    s.insert(
+        "allowed_vote_accounts".to_string(),
+        "notbase58!".to_string(),
+    );
+    let err = Config::from_section(&s).unwrap_err();
+    assert!(err.contains("allowed_vote_accounts entry"), "err: {err}");
+}
+
+/// `output()` puts the summary on line one and the base64 on line two, and
+/// callers split on that, so the summary must never grow a newline no matter
+/// which optional addresses it carries.
+#[test]
+fn the_summary_stays_on_one_line_in_every_variant() {
+    let cases = [
+        (base_config(), Action::Deactivate, None),
+        (base_config(), Action::Delegate, Some(VOTE_ACC)),
+        (durable_config(), Action::Deactivate, None),
+        (durable_config(), Action::Delegate, Some(VOTE_ACC)),
+    ];
+    for (cfg, action, vote) in cases {
+        let stake = cfg.resolve_stake("main").unwrap();
+        let built = build_transaction(&cfg, action, stake, vote, blockhash_bytes()).unwrap();
+        assert!(
+            !built.summary.contains('\n'),
+            "summary broke into lines: {}",
+            built.summary
+        );
+        assert_eq!(built.output().lines().count(), 2, "{}", built.output());
+    }
 }
