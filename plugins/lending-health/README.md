@@ -11,14 +11,14 @@ The tool answers one question for a set of operator-owned wallets: are any
 borrow positions drifting toward liquidation? A scheduled briefing or a chat
 query can then surface a margin problem while there is still time to act on it.
 
-Two protocols are covered by different data paths. Kamino positions come from
+Kamino and MarginFi arrive by different data paths. Kamino positions come from
 the public Kamino REST API (`GET /portfolio/{wallet}`). MarginFi positions come
 straight from on-chain account state, decoded from a `getProgramAccounts` read
 over the operator's own Solana JSON-RPC endpoint, with the maintenance-weighted
 asset and liability values read at fixed byte offsets. For each position the
 tool computes current LTV against that market's liquidation LTV.
 
-Every line names the obligation or account address it was decoded from,
+Position lines carry the obligation or account address they were decoded from,
 shortened to a head and a tail, so a report covering several positions in the
 same market says which one each figure belongs to.
 
@@ -30,19 +30,18 @@ agent context. Positions that the Kamino indexer has not refreshed against the
 current price feed carry a staleness hint, so an old snapshot is never presented
 as live.
 
-A fourth status, `UNKNOWN`, covers the case where the source gave the tool
-nothing to measure against. MarginFi's risk engine zeroes the maintenance pair
-in its health cache when it cannot price an account, and the initial-weight pair
-that remains sits on a different basis against a different line, so it cannot
-stand in. Such a position keeps the values it does carry and the marker `maint
-basis unavailable`; no LTV figure is printed for it. It sorts above the calm
-lines and below the measured warnings.
+`UNKNOWN` covers the case where the source gave the tool nothing to measure
+against. MarginFi's risk engine zeroes the maintenance pair in its health cache
+when it cannot price an account, and the initial-weight pair that remains sits
+on a different basis against a different line, so it cannot stand in. Such a
+position keeps the values it does carry and the marker `maint basis
+unavailable`; no LTV figure is printed for it.
 
-One case escapes `UNKNOWN`. MarginFi keeps a `HEALTHY` bit that its risk engine
-sets itself, and a cleared bit is a verdict the protocol already reached, so it
-needs no basis of ours to be believed. That verdict travels beside the numbers
-rather than inside them, which gives the condemned account two renderings. With
-a maintenance pair on hand, the line prints the ratio that pair measures and
+MarginFi's `HEALTHY` bit escapes `UNKNOWN`. The risk engine sets that bit
+itself, so a cleared bit is a verdict the protocol already reached and needs no
+basis of ours to be believed. That verdict travels beside the numbers rather
+than inside them, which gives the condemned account two renderings. With a
+maintenance pair on hand, the line prints the ratio that pair measures and
 carries the marker `flagged unhealthy` after it. With the pair zeroed, the line
 prints `LTV n/a` and the marker joins the `maint basis unavailable` note. Either
 way the line reads `CRITICAL` and leads the report, where it stays while the
@@ -58,8 +57,7 @@ evidence either way.
 
 Drift is deliberately out of scope. Its API does not expose a current health or
 liquidation figure for an open position, so the tool would have to reconstruct
-one and risk reporting a number that is simply wrong. Reporting nothing beats
-reporting a guess about someone's liquidation distance.
+one and risk reporting a number that is simply wrong.
 
 ## Config keys
 
@@ -76,7 +74,7 @@ section.
 | `protocols` | `kamino,marginfi` | Which protocols to query. |
 | `warn_ltv` | `0.65` | LTV at or above which a position is flagged `WARN`. |
 | `critical_ltv` | `0.80` | LTV at or above which a position is flagged `CRITICAL`. Must exceed `warn_ltv`. |
-| `timeout_secs` | `10` | Per-request connect timeout in seconds, from 1 to 60. |
+| `timeout_secs` | `10` | Per-request connect timeout in seconds, bounded to 1 through 60. |
 
 ## Layout (the reference format)
 
@@ -89,10 +87,10 @@ tests/            # host-run tests over the pure core, with live API fixtures pl
 manifest.toml     # name, version, wasm_path, capabilities, permissions
 ```
 
-Every pure-core module above carries no wasm dependency, so the whole core runs
-under a plain host `cargo test`: it parses config, plans the requests, classifies
-risk, and renders the report. The wasm component reuses that same logic through
-the shim in `src/lib.rs`.
+The core modules above pull in no wasm dependency, so a plain host `cargo test`
+covers config parsing, request planning, risk classification, and report
+rendering. The wasm component reuses that same logic through the shim in
+`src/lib.rs`.
 
 ## Build and test
 
@@ -164,22 +162,21 @@ That failure list is written under the same character cap as the report and out
 of a budget reserved inside it, so a bad day upstream trims its own list instead
 of pushing the delivered payload past the bound the operator was promised.
 
-**No stand-in numbers.** A liquidation distance is printed only when the source
+**No invented numbers.** A liquidation distance is printed only when the source
 supplied the basis it is measured on. When MarginFi's health cache comes back
 with a zeroed maintenance pair, the position is reported as `UNKNOWN` with the
 marker `maint basis unavailable` rather than with a ratio computed on the
-initial-weight pair, which would answer a question the data did not answer. An
-operator reading a margin briefing can act on a missing figure; a plausible
-wrong one is what gets a position liquidated. The suppression stops at the
-figure: a cleared `HEALTHY` flag still classifies the account `CRITICAL`, so a
-missing basis can never demote a position the protocol already condemned. The
-figure is never bent the other way either. A condemned account with a
-maintenance pair prints the ratio that pair measures, since a distance floored
-at the liquidation line would be a stand-in number of the same kind, printed
-beside a deposit and a borrow that visibly disagree with it. And a flag word the
-engine never wrote condemns nothing at all: with `ENGINE_STATUS_OK` unset the
-cache is unknown state, which reads `UNKNOWN` rather than a `CRITICAL` invented
-from a bit nobody set.
+initial-weight pair, which would answer a question the data did not answer.
+
+The suppression stops at the figure: a cleared `HEALTHY` flag still classifies
+the account `CRITICAL`, so a missing basis can never demote a position the
+protocol already condemned. The figure is never bent the other way either. A
+condemned account with a maintenance pair prints the ratio that pair measures,
+since a distance floored at the liquidation line would be a stand-in number of
+the same kind, printed beside a deposit and a borrow that visibly disagree with
+it. And a flag word the engine never wrote condemns nothing at all: with
+`ENGINE_STATUS_OK` unset the cache is unknown state, which reads `UNKNOWN`
+rather than a `CRITICAL` invented from a bit nobody set.
 
 **No custody.** As above, the plugin holds no keys and issues no writes, so a
 prompt-injection ceiling is a wrong or refused report, not a lost position.
@@ -208,10 +205,10 @@ indexer's position snapshot lags the price feed by 39 hours, so the figure is a
 recent read rather than a live one. The header names the count and the worst
 status up front, which is the part a scheduled briefing surfaces first.
 
-The `UNKNOWN` line is the honest half of this report. That MarginFi account was
-captured with a zeroed maintenance pair, so the tool prints the values it read
-and stops there. No percentage appears on that line, because none of the numbers
-on hand measures how far the account sits from its liquidation line.
+The MarginFi account on the `UNKNOWN` line was captured with a zeroed
+maintenance pair, so the tool prints the values it read and stops there. No
+percentage appears on that line, because none of the numbers on hand measures
+how far the account sits from its liquidation line.
 
 ## Prompt-injection test
 
@@ -233,7 +230,3 @@ the operator's config has no path to a request. Even if the model fully complied
 with the injection and passed the attacker's pubkey, the tool physically cannot
 query it. The failure is closed, and the error names only the labels the
 operator actually configured.
-
-## License
-
-Dual-licensed under MIT or Apache-2.0, matching the repository convention.

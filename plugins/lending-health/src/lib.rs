@@ -2,10 +2,9 @@
 //!
 //! Read-only DeFi lending position health for operator-configured wallets,
 //! covering Kamino (public REST API) and MarginFi (raw JSON-RPC decoding).
-//! The pure core lives in [`health`], [`kamino`], and [`marginfi`] with no
-//! wasm dependency, so it compiles and tests on the host with a plain
-//! `cargo test`; the wasm component reuses the same logic through the shim
-//! below.
+//! None of [`health`], [`kamino`], or [`marginfi`] depends on wasm, so the
+//! whole data path builds and tests on the host under a plain `cargo test`.
+//! The component below is a shim over those same functions.
 //!
 //! Build:  rustup target add wasm32-wasip2
 //!         cargo build --target wasm32-wasip2 --release

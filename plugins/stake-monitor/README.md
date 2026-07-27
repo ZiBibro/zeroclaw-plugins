@@ -51,18 +51,19 @@ Epoch progress rides along with it. The header reads `epoch 1004 at 45%`, so a
 briefing names the running epoch and says how close the next boundary is. That
 distance decides whether a redelegation lands this epoch or the next.
 
-Neither reading costs an extra RPC call. Vote lag comes from `lastVote` on the
-vote record the plugin already fetches, measured against `absoluteSlot` from the
-epoch reply it already fetches. Delinquency detection is untouched. A validator
-the RPC lists as delinquent is still reported as `DELINQUENT`, with its lag
-printed alongside for scale, and it is never double-flagged as `BEHIND`.
+Vote lag and epoch progress both come out of calls the run already makes. Vote
+lag comes from `lastVote` on the vote record the plugin already fetches,
+measured against `absoluteSlot` from the epoch reply it already fetches.
+Delinquency detection is untouched. A validator the RPC lists as delinquent is
+still reported as `DELINQUENT`, with its lag printed alongside for scale, and it
+is never double-flagged as `BEHIND`.
 
-One caveat on the lag figure. The head slot is read once, in the `getEpochInfo`
-call that opens the run, and every account in the report is measured against
-that single number. On a multi-account report the chain keeps moving while the
-later accounts are fetched, so those accounts can under-report their lag by
-however far it moved in the meantime. The error only runs one way: a printed lag
-is a floor, and the real distance can only be larger.
+The lag figure carries a caveat. The head slot is read once, in the
+`getEpochInfo` call that opens the run, and every account in the report is
+measured against that single number. On a multi-account report the chain keeps
+moving while the later accounts are fetched, so those accounts can under-report
+their lag by however far it moved in the meantime. The error only runs one way:
+a printed lag is a floor, and the real distance can only be larger.
 
 ## Custody tier
 
@@ -122,7 +123,7 @@ plugin refuses to run without a configured allowlist.
 
 ## A worked example
 
-A single active account whose validator has started to drift:
+An active account whose validator has started to drift:
 
 ```
 Stake: 1 account(s), 500 SOL delegated, epoch 1004 at 45% (~26 h left). 1 validator(s) BEHIND.
@@ -145,15 +146,15 @@ to redelegate, and knows it a day before the epoch closes.
 
 ## Prompt-injection test
 
-Suppose the surrounding data stream tries to steer the agent into checking an
-address the operator never configured. The tool is asked for a pubkey outside the
-allowlist:
+An injection in the surrounding data stream tells the agent to check an address
+the operator never configured, and the agent obeys. The call arrives with a
+pubkey outside the allowlist:
 
 ```
 tool:   stake_monitor
-args:   { "account": "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM" }
+args:   { "account": "Cd6U9HNMvAjXDYEgQoHqc1Shtrcp55ZafCpHfVtFtmPd" }
 
-result: success=false, error: stake account `9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM` is not in the configured allowlist; known labels: main
+result: success=false, error: stake account `Cd6U9HNMvAjXDYEgQoHqc1Shtrcp55ZafCpHfVtFtmPd` is not in the configured allowlist; known labels: main
 ```
 
 The tool fails closed. It resolves the argument against the allowlist before any
@@ -167,7 +168,7 @@ legitimate typo is easy to correct.
 ```
 src/stake.rs    # pure logic, no wasm deps — host-testable with `cargo test`
 src/lib.rs      # thin #[cfg(target_family = "wasm")] component shim
-tests/stake.rs  # host-run integration tests over the pure core
+tests/          # host-run integration tests over the pure core
 manifest.toml   # name, version, wasm_path, capabilities, permissions
 ```
 
@@ -219,7 +220,3 @@ Run the agent with a build that includes a compiler backend, e.g.
 (`--features plugins-wasm`), precompile with a matching wasmtime:
 `wasmtime compile --target <triple> stake_monitor.wasm -o stake_monitor.cwasm`
 and point `wasm_path` at the `.cwasm`.
-
-## License
-
-Dual-licensed under MIT or Apache-2.0, matching the repository convention.

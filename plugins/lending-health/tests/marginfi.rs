@@ -13,10 +13,10 @@ const AUTHORITY: &str = "Dq7wypbedtaqQK9QqEFvfrxc4ppfRGXCeTVd7ee7n2jw";
 
 const GPA_RESPONSE: &str = include_str!("fixtures/marginfi_gpa_response.json");
 
-/// Synthetic companion to the live capture, hand-built for the
-/// maintenance-weighted path: the same account layout with the health cache
-/// rewritten to init-weight 1000/700 USD, a maintenance pair of 800/600 USD,
-/// and a flag word of 7 so no status bit is left unset. Not a mainnet capture.
+/// Hand-built from the live capture to reach the maintenance-weighted path the
+/// capture itself cannot: same account layout, health cache rewritten to
+/// init-weight 1000/700 USD, maintenance pair 800/600 USD, flag word 7 so no
+/// status bit is left unset. Not a mainnet capture.
 const GPA_MAINT_SYNTHETIC: &str = include_str!("fixtures/marginfi_gpa_maint_synthetic.json");
 
 /// Byte offset of the health-cache flag word inside a decoded account.
@@ -40,7 +40,7 @@ fn config() -> Config {
     ]
     .into_iter()
     .collect();
-    Config::from_section(&section).expect("valid section must parse")
+    Config::from_section(&section).expect("test config")
 }
 
 #[test]
@@ -55,13 +55,14 @@ fn request_body_carries_all_three_filters() {
 
 #[test]
 fn live_fixture_decodes_to_one_position() {
-    let positions = parse_gpa_response(GPA_RESPONSE, "main").expect("live fixture must parse");
+    let positions = parse_gpa_response(GPA_RESPONSE, "main").expect("live fixture");
     assert_eq!(positions.len(), 1);
     let p = &positions[0];
     assert_eq!(p.protocol, Protocol::Marginfi);
     assert_eq!(p.market, "acct");
-    // Golden values decoded independently during Gate A pass 2 from the same
-    // live account: init-weight asset 859.59 USD, liability 667.79 USD.
+    // Golden values decoded independently from the same base64 blob in
+    // fixtures/marginfi_gpa_response.json: init-weight asset 859.59 USD,
+    // liability 667.79 USD.
     assert!(
         (p.deposit_usd - 859.59).abs() < 0.05,
         "got {}",
@@ -106,8 +107,7 @@ fn zeroed_maintenance_never_reaches_the_report_as_a_ratio() {
 
 #[test]
 fn synthetic_maintenance_fixture_reports_a_distance() {
-    let positions =
-        parse_gpa_response(GPA_MAINT_SYNTHETIC, "main").expect("synthetic fixture must parse");
+    let positions = parse_gpa_response(GPA_MAINT_SYNTHETIC, "main").expect("synthetic fixture");
     assert_eq!(positions.len(), 1);
     let p = &positions[0];
     assert_eq!(p.account, "8mmH..WD56");
@@ -117,7 +117,7 @@ fn synthetic_maintenance_fixture_reports_a_distance() {
         p.deposit_usd
     );
     assert!((p.borrow_usd - 700.0).abs() < 1e-6, "got {}", p.borrow_usd);
-    let liq = p.liquidation.expect("maintenance pair must yield a basis");
+    let liq = p.liquidation.expect("liquidation basis");
     assert!((liq.ltv - 0.75).abs() < 1e-9, "got {}", liq.ltv);
     assert!((liq.liquidation_ltv - 1.0).abs() < 1e-9);
     assert!(p.stale_hint.is_none(), "hint: {:?}", p.stale_hint);
@@ -176,7 +176,7 @@ fn unhealthy_flag_keeps_the_measured_ratio_and_condemns_the_line() {
     let mut data = account_bytes(GPA_MAINT_SYNTHETIC);
     data[OFFSET_FLAGS] &= !1u8;
     let p = decode_account(&data, "pubkey", "main").unwrap();
-    let liq = p.liquidation.expect("maintenance pair must yield a basis");
+    let liq = p.liquidation.expect("liquidation basis");
     assert!((liq.ltv - 0.75).abs() < 1e-9, "got {}", liq.ltv);
     assert!(p.flagged_unhealthy);
     assert_eq!(p.stale_hint.as_deref(), Some("flagged unhealthy"));
@@ -260,7 +260,7 @@ fn condemned_account_without_a_basis_outranks_every_measured_line() {
     positions.extend((0..41).map(|_| measured.clone()));
 
     let report = render_report(&positions, &config());
-    let first_line = report.lines().nth(1).expect("a data line must render");
+    let first_line = report.lines().nth(1).expect("data line");
     assert!(
         first_line.starts_with("[CRITICAL] main marginfi acct #Cond..1111:"),
         "report: {report}"

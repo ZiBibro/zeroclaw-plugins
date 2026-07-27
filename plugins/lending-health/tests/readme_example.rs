@@ -1,7 +1,6 @@
-//! Pins the worked example in `README.md` to real rendered output. The two
-//! captures come from two different wallets, so the example labels both
-//! `demo`; every figure on the lines below is decoded, none is written by
-//! hand.
+//! Pins the worked example in `README.md` to the rendered output. The Kamino
+//! and the MarginFi capture come from different wallets, which is why the
+//! example labels both `demo`.
 
 use std::collections::HashMap;
 
@@ -32,12 +31,12 @@ fn config() -> Config {
     ]
     .into_iter()
     .collect();
-    Config::from_section(&section).expect("valid section must parse")
+    Config::from_section(&section).expect("test config")
 }
 
 #[test]
 fn readme_worked_example_is_the_rendered_report() {
-    let mut positions = parse_portfolio(KAMINO, "demo").expect("kamino capture must parse");
-    positions.extend(parse_gpa_response(MARGINFI, "demo").expect("marginfi capture must parse"));
+    let mut positions = parse_portfolio(KAMINO, "demo").expect("kamino capture");
+    positions.extend(parse_gpa_response(MARGINFI, "demo").expect("marginfi capture"));
     assert_eq!(render_report(&positions, &config()), EXPECTED);
 }

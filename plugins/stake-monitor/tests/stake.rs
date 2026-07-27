@@ -47,12 +47,12 @@ fn base_section() -> HashMap<String, String> {
 }
 
 fn cfg() -> Config {
-    Config::from_section(&base_section()).expect("base section must parse")
+    Config::from_section(&base_section()).expect("base section")
 }
 
 #[test]
 fn config_parses_valid_section() {
-    let cfg = Config::from_section(&base_section()).expect("valid section must parse");
+    let cfg = Config::from_section(&base_section()).expect("valid section");
     assert_eq!(cfg.accounts.len(), 1);
     assert_eq!(cfg.accounts[0].label, "main");
 }
@@ -73,7 +73,7 @@ fn config_reads_vote_lag_warn_slots() {
     assert_eq!(cfg().vote_lag_warn_slots, DEFAULT_VOTE_LAG_WARN_SLOTS);
     let mut s = base_section();
     s.insert("vote_lag_warn_slots".to_string(), " 8 ".to_string());
-    let tightened = Config::from_section(&s).expect("an in-range override must parse");
+    let tightened = Config::from_section(&s).expect("in-range override");
     assert_eq!(tightened.vote_lag_warn_slots, 8);
 }
 
@@ -125,10 +125,10 @@ fn resolve_rejects_non_allowlisted() {
 
 #[test]
 fn epoch_info_parses_live_shape() {
-    let e = parse_epoch_info(EPOCH_INFO).expect("live shape must parse");
+    let e = parse_epoch_info(EPOCH_INFO).expect("epoch info");
     assert_eq!(e.epoch, 1003);
     assert_eq!(e.absolute_slot, Some(HEAD_SLOT));
-    let p = e.progress.expect("live counters describe a real epoch");
+    let p = e.progress.expect("epoch progress");
     // 425729 of 432000 slots consumed.
     assert_eq!(p.pct(), 98);
     // 6271 slots left at 0.4 s per slot is well under two hours.
@@ -158,7 +158,7 @@ fn assert_account_line_intact(report: &str) {
 #[test]
 fn epoch_info_degrades_without_head_slot() {
     let body = r#"{"jsonrpc":"2.0","result":{"epoch":1003,"slotIndex":425729,"slotsInEpoch":432000},"id":1}"#;
-    let e = parse_epoch_info(body).expect("a missing head slot must not abort the report");
+    let e = parse_epoch_info(body).expect("epoch info");
     assert_eq!(e.absolute_slot, None);
 
     // This validator would be flagged against a known head; with none, the
@@ -184,7 +184,7 @@ fn epoch_info_degrades_without_head_slot() {
 #[test]
 fn epoch_info_degrades_on_zero_length_epoch() {
     let body = r#"{"jsonrpc":"2.0","result":{"absoluteSlot":433721729,"epoch":1003,"slotIndex":0,"slotsInEpoch":0},"id":1}"#;
-    let e = parse_epoch_info(body).expect("a zero-length epoch must not abort the report");
+    let e = parse_epoch_info(body).expect("epoch info");
     assert!(e.progress.is_none());
 
     let report = render_report(
@@ -205,7 +205,7 @@ fn epoch_info_degrades_on_zero_length_epoch() {
 #[test]
 fn epoch_info_degrades_when_slot_index_overruns_the_epoch() {
     let body = r#"{"jsonrpc":"2.0","result":{"absoluteSlot":433721729,"epoch":1003,"slotIndex":432001,"slotsInEpoch":432000},"id":1}"#;
-    let e = parse_epoch_info(body).expect("an overrun index must not abort the report");
+    let e = parse_epoch_info(body).expect("epoch info");
     assert!(e.progress.is_none());
 
     let report = render_report(
@@ -228,19 +228,19 @@ fn epoch_progress_rejects_counters_that_cannot_describe_an_epoch() {
     assert!(EpochProgress::new(432_001, 432_000).is_none());
 
     // The last slot of an epoch is still inside it, and reads as a full 100%.
-    let end = EpochProgress::new(432_000, 432_000).expect("the end slot is in range");
+    let end = EpochProgress::new(432_000, 432_000).expect("end-of-epoch progress");
     assert_eq!(end.pct(), 100);
     assert_eq!(end.hours_to_end(), 0);
 
     // Counters large enough to overflow a u64 multiplication stay bounded.
-    let huge = EpochProgress::new(u64::MAX, u64::MAX).expect("equal counters are in range");
+    let huge = EpochProgress::new(u64::MAX, u64::MAX).expect("equal-counter progress");
     assert_eq!(huge.pct(), 100);
 }
 
 #[test]
 fn stake_account_parses_active_delegation() {
     let body = stake_account_json("18446744073709551615");
-    let s = parse_stake_account(&body).expect("delegated account must parse");
+    let s = parse_stake_account(&body).expect("stake account");
     let d = s.delegation.expect("delegation present");
     assert_eq!(d.voter, VOTER);
     assert_eq!(d.stake_lamports, 499_997_717_120);
@@ -365,8 +365,8 @@ fn delinquent_validator_is_not_double_flagged_as_behind() {
 #[test]
 fn inflation_rewards_parse_live_shape_with_null_commission() {
     let body = r#"{"jsonrpc":"2.0","result":[{"amount":595001,"commission":null,"commissionBps":300,"effectiveSlot":433296296,"epoch":1002,"postBalance":2025175995},null],"id":1}"#;
-    let rewards = parse_inflation_rewards(body, 2).expect("live shape must parse");
-    let first = rewards[0].expect("first entry has a reward");
+    let rewards = parse_inflation_rewards(body, 2).expect("inflation rewards");
+    let first = rewards[0].expect("first reward");
     assert_eq!(first.amount_lamports, 595_001);
     assert_eq!(first.commission_bps, Some(300));
     assert!(rewards[1].is_none());
@@ -505,7 +505,7 @@ fn configured_warn_threshold_drives_the_behind_flag() {
     );
     let mut s = base_section();
     s.insert("vote_lag_warn_slots".to_string(), "100".to_string());
-    let relaxed = Config::from_section(&s).expect("a raised threshold must parse");
+    let relaxed = Config::from_section(&s).expect("raised threshold");
 
     // 61 slots trips the 32-slot default and stays quiet at 100.
     let entries = std::slice::from_ref(&lagging);

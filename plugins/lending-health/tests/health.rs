@@ -24,7 +24,7 @@ fn base_section() -> HashMap<String, String> {
 
 #[test]
 fn config_parses_minimal_valid_section() {
-    let cfg = Config::from_section(&base_section()).expect("valid section must parse");
+    let cfg = Config::from_section(&base_section()).expect("test config");
     assert_eq!(cfg.wallets.len(), 1);
     assert_eq!(cfg.wallets[0].label, "main");
     assert_eq!(cfg.wallets[0].pubkey, WALLET_A);
@@ -86,7 +86,7 @@ fn config_allows_kamino_only_without_rpc_url() {
         ("wallets", &format!("main:{WALLET_A}")[..]),
         ("protocols", "kamino"),
     ]);
-    let cfg = Config::from_section(&s).expect("kamino-only section must parse");
+    let cfg = Config::from_section(&s).expect("kamino-only config");
     assert_eq!(cfg.protocols, vec![Protocol::Kamino]);
     assert!(cfg.rpc_url.is_none());
 }
@@ -217,7 +217,7 @@ fn condemned_position_leads_the_report_and_survives_the_cap() {
     let report = render_report(&positions, &cfg);
 
     assert!(report.starts_with("Lending health: 61 position(s), worst risk CRITICAL."));
-    let first_line = report.lines().nth(1).expect("a data line must render");
+    let first_line = report.lines().nth(1).expect("data line");
     assert!(
         first_line.starts_with("[CRITICAL] main"),
         "line: {first_line}"

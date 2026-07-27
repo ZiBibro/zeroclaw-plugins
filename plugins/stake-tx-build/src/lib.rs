@@ -66,9 +66,9 @@ mod component {
         fn description() -> String {
             "Builds an UNSIGNED Solana stake transaction (delegate or deactivate) for a \
              stake account from the configured allowlist, returned as base64 for the \
-             operator to review and sign in their own wallet. Holds no keys; cannot \
-             sign or submit. Delegation targets must be in the configured vote account \
-             allowlist; arbitrary addresses are refused."
+             operator to review and sign in their own wallet. Delegation targets come \
+             from a second operator allowlist. This component holds no key material and \
+             cannot sign or submit anything."
                 .to_string()
         }
 

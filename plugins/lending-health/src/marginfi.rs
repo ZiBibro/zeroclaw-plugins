@@ -115,23 +115,17 @@ pub fn decode_account(data: &[u8], pubkey: &str, wallet_label: &str) -> Option<P
     let engine_ok = flags & FLAG_ENGINE_STATUS_OK != 0;
     let oracle_ok = flags & FLAG_ORACLE_OK != 0;
 
-    // A cleared HEALTHY bit only condemns when the engine is the one who
-    // cleared it. With ENGINE_STATUS_OK unset the cache holds whatever stood
-    // there before the last check, down to the all-zero word an account
-    // carries before its first check ever runs, and a bit nobody set is the
-    // absence of a verdict rather than a bad one.
+    // ENGINE_STATUS_OK gates the HEALTHY reading. Without it the flag word is
+    // whatever stood there before the last risk check, down to the all-zero
+    // word of an account never checked, so a clear HEALTHY bit is no verdict.
     let condemned = engine_ok && !healthy;
 
     // Liquidation begins when maintenance-weighted liabilities reach
-    // maintenance-weighted assets, so that ratio maps onto the LTV scale with
-    // the liquidation threshold at 1.0. The risk engine zeroes the maintenance
-    // pair when it cannot price the account, and the initial-weight pair sits
-    // on a different basis against a different line: it cannot stand in. Such
-    // an account is reported with the values it does carry and no liquidation
-    // distance at all, marked so the operator knows why the distance is gone.
-    // The verdict travels beside the ratio instead of inside it: whatever the
-    // maintenance pair measures is what gets printed, and `flagged_unhealthy`
-    // carries the condemnation, which needs no basis to be believed.
+    // maintenance-weighted assets, so their ratio is an LTV with its threshold
+    // at 1.0. The engine zeroes that pair when it cannot price the account, and
+    // the init-weight pair measures against a different line, so a zeroed pair
+    // yields no LTV figure at all. `flagged_unhealthy` carries the verdict
+    // beside the ratio, needing no basis of its own.
     let (liquidation, stale_hint) = if !engine_ok {
         (None, Some("engine status unset".to_string()))
     } else if asset_maint > 0.0 {

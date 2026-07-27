@@ -1,14 +1,17 @@
 //! Pure core of the `stake_tx_build` tool: config parsing and the byte-level
 //! assembly of unsigned legacy Solana transactions for stake delegation and
-//! stake deactivation. No wasm bindings and no I/O live here, so the whole
-//! module runs under a plain host `cargo test`.
+//! stake deactivation. No wasm and no I/O in here, so the whole module runs
+//! under a plain host `cargo test`.
 //!
-//! Every instruction-level byte fact (discriminants, account order, flags,
-//! message layout, compact-u16) follows the Gate A verification report
-//! `research/gate-a/p2-stake-tx.md`, which was checked against the
-//! solana-program sources and a live mainnet delegate transaction. The
-//! builder produces transactions only; it never sees a private key and it
-//! cannot sign or submit anything.
+//! The instruction-level byte facts come from `solana-program`: discriminants
+//! and account order from `stake::instruction` and
+//! `system_instruction::advance_nonce_account`, message layout and compact-u16
+//! from the `solana-sdk` `short_vec` encoding. A live mainnet delegate
+//! transaction, signature
+//! `5yaZiJMVnN5fM5K4rHQFrntaprKQJJbuLqiVGWh7Dkg1MqtswUno83BTozmzN8xAfLZTtFTZiwhTUZsmNoa5kVRA`,
+//! is kept in `tests/fixtures` and checked byte for byte. The builder produces
+//! transactions only; it never sees a private key and it cannot sign or submit
+//! anything.
 
 use std::collections::HashMap;
 
@@ -28,29 +31,30 @@ const CONFIG_KEYS: [&str; 8] = [
     "timeout_secs",
 ];
 
-/// Stake program id, confirmed by the mainnet fixture in p2-stake-tx.md
-/// section 3 (accountKeys[4] of the delegate transaction).
+/// Stake program id, confirmed by the mainnet delegate fixture
+/// (`accountKeys[4]` of the transaction in `tests/fixtures`).
 pub const STAKE_PROGRAM_ID: &str = "Stake11111111111111111111111111111111111111";
 
 /// System program id; owner of nonce accounts and home of
-/// AdvanceNonceAccount (p2-stake-tx.md section 2).
+/// AdvanceNonceAccount (`solana-program::system_instruction`).
 pub const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 
 /// Clock sysvar, account 2 of DelegateStake and account 1 of Deactivate
-/// (p2-stake-tx.md section 1).
+/// (`solana-program::stake::instruction`).
 pub const SYSVAR_CLOCK_ID: &str = "SysvarC1ock11111111111111111111111111111111";
 
-/// Stake history sysvar, account 3 of DelegateStake (p2-stake-tx.md
-/// section 1). Deactivate does not take it.
+/// Stake history sysvar, account 3 of DelegateStake
+/// (`solana-program::stake::instruction`). Deactivate does not take it.
 pub const SYSVAR_STAKE_HISTORY_ID: &str = "SysvarStakeHistory1111111111111111111111111";
 
 /// Stake config account, account 4 of DelegateStake. Semantically dead but
-/// positionally required for compatibility; address confirmed by
-/// p2-stake-tx.md section 1 (declare_deprecated_id in config.rs).
+/// positionally required for compatibility; the address comes from
+/// `declare_deprecated_id!` in the `solana-program` stake `config` module.
 pub const STAKE_CONFIG_ID: &str = "StakeConfig11111111111111111111111111111111";
 
 /// RecentBlockhashes sysvar, account 1 of AdvanceNonceAccount. Deprecated
-/// but still mandatory in the instruction (p2-stake-tx.md section 2).
+/// but still mandatory in the instruction
+/// (`solana-program::system_instruction::advance_nonce_account`).
 pub const SYSVAR_RECENT_BLOCKHASHES_ID: &str = "SysvarRecentB1ockHashes11111111111111111111";
 
 /// Genesis hash of Solana mainnet-beta, the cluster identity this builder
@@ -465,11 +469,10 @@ pub fn parse_latest_blockhash(body: &str) -> Result<[u8; 32], String> {
 }
 
 /// Extracts the durable blockhash from a nonce account read with
-/// `getAccountInfo` (encoding base64). The 32 hash bytes sit at offset
-/// 40..72 of the account data; the offset is fixed by the Gate A design
-/// document (design.md, durable nonce section) and by the task
-/// specification. p2-stake-tx.md covers the AdvanceNonceAccount instruction
-/// bytes; the state layout offset comes from that design review.
+/// `getAccountInfo` (encoding base64). The account data is a
+/// `solana-program::nonce::state::Versions`: a 4-byte version tag, a 4-byte
+/// state tag, the 32-byte nonce authority at bytes 8..40, then the durable
+/// blockhash at bytes 40..72, which is the field this reads.
 pub fn parse_nonce_blockhash(body: &str) -> Result<[u8; 32], String> {
     let r = rpc_result(body)?;
     let value = r
@@ -521,10 +524,10 @@ pub struct Instruction {
 }
 
 /// DelegateStake. Discriminant 2 as u32 little-endian, no payload; account
-/// order and flags exactly as in p2-stake-tx.md section 1 (delegate_stake in
-/// solana-program/stake, confirmed byte-for-byte by the mainnet fixture in
-/// section 3). Account 4 is the deprecated stake config: unused by the
-/// program but positionally required.
+/// order and flags exactly as in `solana-program::stake::instruction`
+/// (`delegate_stake`), confirmed byte for byte against the mainnet fixture.
+/// Account 4 is the deprecated stake config: unused by the program but
+/// positionally required.
 pub fn delegate_stake_instruction(
     stake: [u8; 32],
     authority: [u8; 32],
@@ -569,8 +572,8 @@ pub fn delegate_stake_instruction(
 }
 
 /// Deactivate. Discriminant 5 as u32 little-endian, no payload; account
-/// order and flags exactly as in p2-stake-tx.md section 1 (deactivate_stake
-/// in solana-program/stake). Takes neither stake history nor stake config.
+/// order and flags exactly as in `solana-program::stake::instruction`
+/// (`deactivate_stake`). Takes neither stake history nor stake config.
 pub fn deactivate_instruction(stake: [u8; 32], authority: [u8; 32]) -> Instruction {
     Instruction {
         program_id: known_key(STAKE_PROGRAM_ID),
@@ -596,9 +599,9 @@ pub fn deactivate_instruction(stake: [u8; 32], authority: [u8; 32]) -> Instructi
 }
 
 /// AdvanceNonceAccount. System program discriminant 4 as u32 little-endian,
-/// no payload; account order and flags exactly as in p2-stake-tx.md
-/// section 2 (advance_nonce_account in anza-xyz/solana-sdk). The deprecated
-/// RecentBlockhashes sysvar is still mandatory in the instruction.
+/// no payload; account order and flags exactly as in
+/// `solana-program::system_instruction::advance_nonce_account`. The
+/// deprecated RecentBlockhashes sysvar is still mandatory in the instruction.
 pub fn advance_nonce_instruction(nonce: [u8; 32], nonce_authority: [u8; 32]) -> Instruction {
     Instruction {
         program_id: known_key(SYSTEM_PROGRAM_ID),
@@ -627,9 +630,8 @@ pub fn advance_nonce_instruction(nonce: [u8; 32], nonce_authority: [u8; 32]) -> 
 // compact-u16
 // ---------------------------------------------------------------------------
 
-/// Encodes a value as compact-u16 (1 to 3 bytes). Normative behavior per
-/// p2-stake-tx.md section 4, quoting the ShortU16 doc in
-/// anza-xyz/solana-sdk short-vec: 7 payload bits per byte, high bit set on
+/// Encodes a value as compact-u16 (1 to 3 bytes), matching `ShortU16` in the
+/// `solana-sdk` `short_vec` module: 7 payload bits per byte, high bit set on
 /// every byte that has a continuation.
 pub fn encode_compact_u16(value: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(3);
@@ -709,8 +711,8 @@ fn upsert(metas: &mut Vec<KeyMeta>, key: [u8; 32], signer: bool, writable: bool)
     }
 }
 
-/// Deduplicates account keys and partitions them into the four groups fixed
-/// by p2-stake-tx.md section 4: signer writable first, then signer
+/// Deduplicates account keys and partitions them into the four groups the
+/// legacy message header implies: signer writable first, then signer
 /// read-only, then non-signer writable, then non-signer read-only. Within a
 /// group the order is first appearance, with the fee payer always in front
 /// and program ids appended after all instruction accounts (an
@@ -784,8 +786,8 @@ pub fn compile_message(
     })
 }
 
-/// Serializes a legacy message in the wire order fixed by p2-stake-tx.md
-/// section 4: three header bytes, compact-u16 key count, the 32-byte keys,
+/// Serializes a legacy message in the wire order of the `solana-sdk` legacy
+/// `Message`: three header bytes, compact-u16 key count, the 32-byte keys,
 /// the recent blockhash, compact-u16 instruction count, then each compiled
 /// instruction as program index, compact-u16 account count, account
 /// indices, compact-u16 data length, data.
@@ -810,13 +812,12 @@ pub fn serialize_message(msg: &CompiledMessage) -> Vec<u8> {
     out
 }
 
-/// Serializes the full wire transaction: compact-u16 signature count, then
-/// the signatures, then the message (p2-stake-tx.md section 4). For an
-/// unsigned transaction the signature count still equals
+/// Serializes the full wire transaction the `solana-sdk` legacy `Transaction`
+/// describes: compact-u16 signature count, then the signatures, then the
+/// message. For an unsigned transaction the signature count still equals
 /// num_required_signatures and each slot holds 64 zero bytes; the wallet
-/// replaces the placeholders when it signs. The report describes only this
-/// whole-transaction wire format, so the tool returns the full transaction
-/// and no separate message blob.
+/// replaces the placeholders when it signs. The tool hands back this
+/// whole-transaction form and no separate message blob.
 pub fn serialize_transaction(num_required_signatures: u8, message: &[u8]) -> Vec<u8> {
     let sig_bytes = 64 * num_required_signatures as usize;
     let mut out = Vec::with_capacity(3 + sig_bytes + message.len());

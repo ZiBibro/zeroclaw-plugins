@@ -1,6 +1,8 @@
-//! Pure core of the `lending-health` tool: config parsing, request planning,
-//! risk classification, and report rendering. No wasm and no I/O in here, so
-//! the whole module runs under a plain host `cargo test`.
+//! Everything `lending_health` does between reading its config and handing back
+//! a report: config parsing, wallet resolution, risk classification against the
+//! configured thresholds, and rendering under a character cap. Nothing in here
+//! touches the network or the wasm bindings, so `cargo test` on the host
+//! exercises all of it.
 
 use std::collections::HashMap;
 
@@ -368,14 +370,15 @@ pub fn render_payload(positions: &[Position], issues: &[String], cfg: &Config) -
     format!("{report}{suffix}")
 }
 
-/// Renders the error text for a run where every source call failed. The failure
-/// path carries server-controlled strings too, so it is bounded by the same
-/// budget as the success path rather than pasting every upstream message into
-/// the agent context.
+/// Renders the error text for a run in which no source call came back, Kamino
+/// REST and MarginFi RPC alike. Upstream failure messages are server-controlled
+/// text, so this path renders under the same character budget as a report
+/// instead of pasting whatever the endpoints returned into the agent context.
 pub fn render_total_failure(issues: &[String]) -> String {
     let listed = render_issues(issues);
-    // `render_issues` opens with a newline and its own label; the failure text
-    // reads as one line, so both are replaced here.
+    // `render_issues` writes the trailing line of a report: a leading newline,
+    // then a `Data issues: ` label. Neither belongs in a one-sentence error, so
+    // both come off before the detail behind them is reused.
     let detail = listed
         .trim_start_matches('\n')
         .trim_start_matches("Data issues: ");

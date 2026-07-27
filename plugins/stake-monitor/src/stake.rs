@@ -617,14 +617,15 @@ pub fn render_payload(
     format!("{report}{suffix}")
 }
 
-/// Renders the error text for a run where every stake account read failed. The
-/// failure path carries server-controlled strings too, so it is bounded by the
-/// same budget as the success path rather than pasting every upstream message
-/// into the agent context.
+/// Error text for a run where every stake account read failed, so there is no
+/// report to deliver. The detail is the issue list rendered under
+/// [`ISSUE_CHAR_BUDGET`], the bound the success path applies as well, since the
+/// strings inside it were written by whatever server answered the RPC.
 pub fn render_total_failure(issues: &[String]) -> String {
     let listed = render_issues(issues);
-    // `render_issues` opens with a newline and its own label; the failure text
-    // reads as one line, so both are stripped here.
+    // `render_issues` writes the trailing line of a report: a leading newline,
+    // then a `Data issues: ` label. Neither belongs in a one-sentence error, so
+    // both come off before the detail behind them is reused.
     let detail = listed
         .trim_start_matches('\n')
         .trim_start_matches("Data issues: ");

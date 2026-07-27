@@ -7,9 +7,9 @@ into an unsigned transaction that a human still has to sign.
 
 ## What it does
 
-Builds one unsigned legacy Solana transaction, either a `delegate` or a
+A call produces an unsigned legacy Solana transaction, either a `delegate` or a
 `deactivate`, for a stake account named in the operator's allowlist. The output
-is two lines: a plain-language summary for the approval gate, then the
+opens with a plain-language summary for the approval gate and closes with the
 transaction as base64 on its own labeled line. A person reads the summary and
 signs in their own wallet. The plugin signs nothing and submits nothing; no
 private key ever reaches it.
@@ -21,10 +21,11 @@ artifact small and the transaction layout auditable down to the byte.
 
 Before any of that, the plugin asks the configured endpoint for its genesis
 hash and compares it against the pinned cluster, which defaults to
-mainnet-beta. One extra read per call, and a mismatch aborts before a single
-transaction byte exists. A URL alone says nothing about the chain behind it, so
-an endpoint that answers honestly while serving devnet or testnet is caught by
-its own reply. The threat model below states the limits of that check.
+mainnet-beta. The check costs one extra read per call, and a mismatch aborts
+before a single transaction byte exists. A URL alone says nothing about the
+chain behind it, so an endpoint that answers honestly while serving devnet or
+testnet is caught by its own reply. The threat model below states the limits of
+that check.
 
 A durable nonce is optional. When the config sets `nonce_account` together with
 `nonce_authority`, the first instruction becomes `AdvanceNonceAccount` and the
@@ -32,16 +33,15 @@ transaction draws its blockhash from the nonce account state, so it does not go
 stale while it waits in an approval queue. Without a nonce the tool reads a
 fresh blockhash and the summary warns that the signing window is short.
 
-One limit is deliberate and worth stating outright: the builder does not run a
-live validator health check before it delegates. Target safety is enforced by
-the vote account allowlist, and live health belongs to the separate
-`stake-monitor` tool.
+The builder runs no live validator health check before it delegates, and that
+gap is deliberate. Target safety is enforced by the vote account allowlist, and
+live health belongs to the separate `stake-monitor` tool.
 
 ## Config keys
 
 The operator configures the plugin by name; the host resolves that one section
-and injects it as a flat `string -> string` map (`__config`), gated behind the
-`config_read` permission.
+and hands the plugin a flat `string -> string` map, injected as `__config`. This
+only happens because the manifest requests the `config_read` permission.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -87,8 +87,7 @@ cp target/wasm32-wasip2/release/stake_tx_build.wasm stake_tx_build.wasm
 This tool builds unsigned transactions and holds no keys. Its only outbound
 calls are reads against the operator's own RPC endpoint: the cluster genesis
 hash, then a blockhash or the nonce account state. Everything it produces is
-inert until a human signs it in a wallet the plugin never sees. On its own it
-cannot move a single lamport.
+inert until a human signs it in a wallet the plugin never sees.
 
 The manifest asks for exactly two permissions: `http_client` for those RPC
 reads and `config_read` for its own jailed config section. Neither one can sign
@@ -118,11 +117,13 @@ defenses do not depend on the agent behaving.
   mainnet constant and passes, because nothing binds that reply to the
   blockhash that follows, and a chain forked from mainnet inherits mainnet's
   genesis hash, so it answers correctly too. Trust in the endpoint itself stays
-  with the operator who configured it. Host tests cover the decision logic in
-  the pure core: the reply parse, and the refusal on either a mismatch or a
-  malformed reply. That the gate runs before any transaction byte is assembled
-  lives in the wasm shim in `src/lib.rs`, alongside the blockhash and nonce
-  reads, and is not exercised by `cargo test`.
+  with the operator who configured it.
+
+  Host tests cover the decision logic in the pure core: the reply parse, and
+  the refusal on either a mismatch or a malformed reply. That the gate runs
+  before any transaction byte is assembled lives in the wasm shim in
+  `src/lib.rs`, alongside the blockhash and nonce reads, and is not exercised
+  by `cargo test`.
 - **Unknown config keys fail closed.** A typo such as `allowed_vote_account`
   does not silently weaken an allowlist; parsing stops with an error. The same
   holds for `cluster`: `mainnet` is not `mainnet-beta`, and the near miss is
@@ -130,10 +131,10 @@ defenses do not depend on the agent behaving.
 - **Unexpected arguments fail closed.** The argument schema rejects any field it
   does not recognize, so a smuggled parameter aborts the call.
 
-One guard the tool does not provide: it does not check whether a validator is
-healthy or delinquent before it delegates. That judgment stays with the
-operator's allowlist and with `stake-monitor`. This builder's job ends at an
-unsigned transaction that is correct and confined to the allowlist.
+The tool does not check whether a validator is healthy or delinquent before it
+delegates. That judgment stays with the operator's allowlist and with
+`stake-monitor`. This builder's job ends at an unsigned transaction that is
+correct and confined to the allowlist.
 
 ## A worked example
 
@@ -160,29 +161,31 @@ error: cluster mismatch: rpc_url reports genesis `EtWTRABZaYq6iMfeYKouRu166VU2xq
 
 ## Prompt-injection test
 
-Suppose an agent is talked into deactivating a stake account the operator never
-configured, and into delegating stake to an attacker's validator. Both calls
-fail closed. The tool builds zero transactions.
+An injected instruction tells the agent to redirect the operator's stake to a
+validator the attacker controls, and to deactivate a stake account the operator
+never configured. Both calls fail closed. The tool builds zero transactions.
 
-A `deactivate` for a stake account outside the allowlist:
-
-```
-success=false
-error: stake account `9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM` is not in the configured allowlist; known labels: main
-```
-
-A `delegate` while the operator has enabled no delegation target at all:
+The `delegate`, carrying a vote account that is not among the operator's
+approved validators:
 
 ```
 success=false
-error: delegate is disabled: config key `allowed_vote_accounts` is not set
+error: vote account `5btPEka74QyPuY7Yj6wks8oHHLFMqHWFiRraSLzUB5Ev` is not in the configured allowed_vote_accounts allowlist
 ```
 
-An agent pushed by an injection to move stake runs into two independent
-allowlists at once. The stake account it names is not configured, so
-`deactivate` refuses. Delegation is switched off until the operator opts in, so
-`delegate` refuses before it even looks at the target. The count of
-transactions produced is zero.
+The `deactivate`, naming a stake account the config never mentions:
+
+```
+success=false
+error: stake account `Eu9abQ8jj3Dj6MrN8oW6wuyosLrMmA8ZwWWnifCKTvmp` is not in the configured allowlist; known labels: main
+```
+
+An agent pushed by an injection runs into two independent allowlists at once,
+and neither of them takes its contents from the model. The delegation target
+has to be a vote account the operator wrote into `allowed_vote_accounts`; on a
+config that never set that key, `delegate` refuses a step earlier still, with
+`delegate is disabled`. The stake account has to be one the operator named, and
+the error names the allowlist labels so a legitimate typo is easy to correct.
 
 ## Install
 
@@ -203,7 +206,3 @@ Run the agent with a build that includes a compiler backend, e.g.
 (`--features plugins-wasm`), precompile with a matching wasmtime:
 `wasmtime compile --target <triple> stake_tx_build.wasm -o stake_tx_build.cwasm`
 and point `wasm_path` at the `.cwasm`.
-
-## License
-
-Dual-licensed under MIT or Apache-2.0, matching the repository convention.

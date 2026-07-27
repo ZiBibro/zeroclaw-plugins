@@ -12,8 +12,9 @@ use stake_tx_build::txbuild::{
     SYSVAR_RECENT_BLOCKHASHES_ID, SYSVAR_STAKE_HISTORY_ID, TESTNET_GENESIS_HASH,
 };
 
-/// Raw mainnet getTransaction reply for delegate signature
-/// 5yaZiJMV... captured during Gate A pass 2 (see p2-stake-tx.md section 3).
+/// Raw mainnet `getTransaction` reply for the delegate transaction at slot
+/// 433728871, signature
+/// `5yaZiJMVnN5fM5K4rHQFrntaprKQJJbuLqiVGWh7Dkg1MqtswUno83BTozmzN8xAfLZTtFTZiwhTUZsmNoa5kVRA`.
 const MAINNET_DELEGATE: &str = include_str!("fixtures/mainnet_delegate_5yaZiJMV.json");
 
 // Pubkeys reused from the mainnet fixture so every constant is a real,
@@ -42,14 +43,14 @@ fn base_section() -> HashMap<String, String> {
 }
 
 fn base_config() -> Config {
-    Config::from_section(&base_section()).expect("base section must parse")
+    Config::from_section(&base_section()).expect("base config")
 }
 
 fn durable_config() -> Config {
     let mut s = base_section();
     s.insert("nonce_account".to_string(), NONCE_ACC.to_string());
     s.insert("nonce_authority".to_string(), AUTHORITY.to_string());
-    Config::from_section(&s).expect("durable section must parse")
+    Config::from_section(&s).expect("durable nonce config")
 }
 
 fn blockhash_bytes() -> [u8; 32] {
@@ -212,7 +213,7 @@ fn vote_outside_allowlist_is_refused() {
 fn delegate_without_vote_allowlist_is_disabled() {
     let mut s = base_section();
     s.remove("allowed_vote_accounts");
-    let cfg = Config::from_section(&s).expect("section without vote allowlist parses");
+    let cfg = Config::from_section(&s).expect("config without a vote allowlist");
     let err = validate_vote(&cfg, Action::Delegate, Some(VOTE_ACC)).unwrap_err();
     assert!(err.contains("delegate is disabled"), "err: {err}");
 }
@@ -238,8 +239,8 @@ fn deactivate_rejects_vote_argument() {
 
 #[test]
 fn compact_u16_boundary_values() {
-    // Boundary encodings per the ShortU16 spec quoted in p2-stake-tx.md
-    // section 4: 7 payload bits per byte, continuation bit on top.
+    // Boundary encodings per `ShortU16` in the `solana-sdk` `short_vec`
+    // module: 7 payload bits per byte, continuation bit on top.
     let cases: [(u16, &[u8]); 6] = [
         (0, &[0x00]),
         (127, &[0x7f]),
@@ -251,7 +252,7 @@ fn compact_u16_boundary_values() {
     for (value, expected) in cases {
         assert_eq!(encode_compact_u16(value), expected, "encode {value}");
         assert_eq!(
-            decode_compact_u16(expected).expect("boundary value must decode"),
+            decode_compact_u16(expected).expect("boundary encoding"),
             (value, expected.len()),
             "decode {value}"
         );
@@ -288,9 +289,9 @@ fn latest_blockhash_parses_live_shape() {
 }
 
 fn nonce_body_with_hash(hash: &[u8; 32], owner: &str) -> String {
-    // Nonce state layout: 4-byte version tag, 4-byte state tag, 32-byte
-    // authority, then the durable blockhash at offset 40 (design.md,
-    // durable nonce section).
+    // Nonce state layout per `solana-program::nonce::state::Versions`:
+    // 4-byte version tag, 4-byte state tag, 32-byte authority, then the
+    // durable blockhash at offset 40.
     let mut data = vec![0u8; 80];
     data[40..72].copy_from_slice(hash);
     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
@@ -418,7 +419,7 @@ struct MainnetDelegate {
 }
 
 fn mainnet_delegate() -> MainnetDelegate {
-    let root: Value = serde_json::from_str(MAINNET_DELEGATE).expect("fixture is JSON");
+    let root: Value = serde_json::from_str(MAINNET_DELEGATE).expect("fixture JSON");
     let message = &root["result"]["transaction"]["message"];
     let account_keys: Vec<String> = message["accountKeys"]
         .as_array()
@@ -431,7 +432,7 @@ fn mainnet_delegate() -> MainnetDelegate {
         .unwrap()
         .iter()
         .find(|ix| ix["data"] == "3xyZh")
-        .expect("fixture holds the delegate instruction");
+        .expect("delegate instruction");
     let instruction_pubkeys: Vec<String> = ix["accounts"]
         .as_array()
         .unwrap()
@@ -441,7 +442,7 @@ fn mainnet_delegate() -> MainnetDelegate {
     let program_id = account_keys[ix["programIdIndex"].as_u64().unwrap() as usize].clone();
     let data_bytes = bs58::decode(ix["data"].as_str().unwrap())
         .into_vec()
-        .expect("instruction data is base58");
+        .expect("instruction data");
     MainnetDelegate {
         account_keys,
         instruction_pubkeys,
@@ -454,7 +455,7 @@ fn mainnet_delegate() -> MainnetDelegate {
 fn golden_delegate_matches_mainnet_instruction_bytes() {
     let fixture = mainnet_delegate();
     assert_eq!(fixture.program_id, STAKE_PROGRAM_ID);
-    // u32 LE discriminant 2 (p2-stake-tx.md section 1), byte for byte.
+    // u32 LE discriminant 2, byte for byte.
     assert_eq!(fixture.data_bytes, vec![2u8, 0, 0, 0]);
 
     // Rebuild the instruction from the same stake account, authority, and
@@ -480,7 +481,8 @@ fn golden_delegate_matches_mainnet_instruction_bytes() {
     assert_eq!(fixture.instruction_pubkeys[4], STAKE_CONFIG_ID);
 
     // Flags: stake writable non-signer, then four read-only non-signers,
-    // authority read-only signer (p2-stake-tx.md section 1 table).
+    // authority read-only signer, as in
+    // `solana-program::stake::instruction::delegate_stake`.
     assert!(ours.accounts[0].is_writable && !ours.accounts[0].is_signer);
     for meta in &ours.accounts[1..5] {
         assert!(!meta.is_writable && !meta.is_signer);
@@ -545,8 +547,8 @@ fn golden_delegate_message_normalized_against_mainnet() {
 // Built transactions: structure, durability, round trip
 // ---------------------------------------------------------------------------
 
-/// Minimal wire-format reader for assertions, following the transaction
-/// layout in p2-stake-tx.md section 4.
+/// Minimal wire-format reader for assertions, following the `solana-sdk`
+/// legacy transaction layout.
 struct DecodedTx {
     signature_count: u16,
     signatures: Vec<u8>,
@@ -607,7 +609,7 @@ fn deactivate_builds_expected_wire_transaction() {
 
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&built.tx_base64)
-        .expect("output must be valid base64");
+        .expect("base64 output");
     let tx = decode_tx(&bytes);
 
     // Unsigned form: the signature count equals numRequiredSignatures and
@@ -623,7 +625,7 @@ fn deactivate_builds_expected_wire_transaction() {
     assert_eq!(tx.recent_blockhash, blockhash_bytes());
 
     // One Deactivate instruction: u32 LE discriminant 5, accounts stake,
-    // clock, authority (p2-stake-tx.md section 1).
+    // clock, authority, as in `solana-program::stake::instruction`.
     assert_eq!(tx.instructions.len(), 1);
     let (program_index, indices, data) = &tx.instructions[0];
     assert_eq!(
@@ -707,8 +709,8 @@ fn durable_variant_prepends_advance_nonce_and_uses_nonce_blockhash() {
     assert_eq!(tx.instructions.len(), 2);
 
     // First instruction must be AdvanceNonceAccount: System program, u32 LE
-    // discriminant 4, accounts nonce, RecentBlockhashes sysvar, authority
-    // (p2-stake-tx.md section 2).
+    // discriminant 4, accounts nonce, RecentBlockhashes sysvar, authority,
+    // as in `solana-program::system_instruction::advance_nonce_account`.
     let (program_index, indices, data) = &tx.instructions[0];
     assert_eq!(
         tx.account_keys[*program_index as usize],

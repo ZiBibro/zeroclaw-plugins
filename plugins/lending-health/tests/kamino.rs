@@ -14,7 +14,7 @@ fn url_is_built_from_base_and_wallet() {
 
 #[test]
 fn active_fixture_yields_lending_and_multiply_positions() {
-    let positions = parse_portfolio(ACTIVE, "main").expect("live fixture must parse");
+    let positions = parse_portfolio(ACTIVE, "main").expect("live fixture");
     assert_eq!(positions.len(), 3, "2 lending + 1 multiply obligations");
     assert!(positions.iter().all(|p| p.protocol == Protocol::Kamino));
     assert!(positions.iter().all(|p| p.wallet_label == "main"));
@@ -23,17 +23,17 @@ fn active_fixture_yields_lending_and_multiply_positions() {
     assert_eq!(vanilla.market, "Vanilla@47tf");
     assert!((vanilla.deposit_usd - 200_638.24).abs() < 0.01);
     assert!((vanilla.borrow_usd - 125_169.05).abs() < 0.01);
-    let vanilla_liq = vanilla.liquidation.expect("kamino rows carry a basis");
+    let vanilla_liq = vanilla.liquidation.expect("liquidation basis");
     assert!((vanilla_liq.ltv - 0.623854).abs() < 1e-4);
     assert!((vanilla_liq.liquidation_ltv - 0.75).abs() < 1e-9);
 
-    let tight = positions[1].liquidation.expect("kamino rows carry a basis");
+    let tight = positions[1].liquidation.expect("liquidation basis");
     assert!((tight.ltv - 0.753300).abs() < 1e-4);
     assert!((tight.liquidation_ltv - 0.799089).abs() < 1e-4);
 
     let multiply = &positions[2];
     assert_eq!(multiply.market, "Multiply@47tf");
-    let multiply_liq = multiply.liquidation.expect("kamino rows carry a basis");
+    let multiply_liq = multiply.liquidation.expect("liquidation basis");
     assert!((multiply_liq.ltv - 0.654767).abs() < 1e-4);
 }
 
