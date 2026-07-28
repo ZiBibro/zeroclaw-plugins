@@ -1023,3 +1023,51 @@ fn a_hostile_rpc_error_message_is_quoted_and_bounded() {
         err.len()
     );
 }
+
+/// Raw `getAccountInfo` bytes of a real, live nonce account, created on devnet
+/// on 2026-07-28 at `6V5XF6i2J7zHXuT5EF379x27AKGbFnWcYWfK9z1ZCXka` and read back
+/// through the public devnet RPC.
+///
+/// Every field below was cross-checked against `solana nonce-account`, which
+/// reported blockhash `EMt3s382UNehaXmyFJvMGiTZDXN151hGMMw7pgrBuRzh`, authority
+/// `AAJNL7uZrwcCFPAFJHRiSDEKXGgdZXhpL427iqkDFnre`, and a fee of 5000 lamports
+/// per signature. The account is 80 bytes with version tag 1 and state tag 1,
+/// confirming the layout this parser assumes.
+///
+/// This replaces guesswork with evidence: the hand-built fixtures for this path
+/// originally carried version tag 0, a shape the runtime refuses outright, so
+/// the parser had been exercised against data no validator would accept.
+const LIVE_NONCE_DATA_B64: &str = "AQAAAAEAAACIGwwiWM39onCxWlEpQr9tof+YeSLPdx1nrOr63vY148aBRJYjgaaxyZUb3uhRUeeHh8zlqbd6RcqKTzr/c6ISiBMAAAAAAAA=";
+
+#[test]
+fn the_parser_reads_a_real_live_nonce_account() {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":{{"lamports":10000000,"owner":"{SYSTEM_PROGRAM_ID}","data":["{LIVE_NONCE_DATA_B64}","base64"],"executable":false,"rentEpoch":0,"space":80}}}},"id":1}}"#
+    );
+
+    let hash = parse_nonce_blockhash(&body).expect("a live nonce account must parse");
+    // The value `solana nonce-account` printed for this account.
+    let expected = decode_pubkey("EMt3s382UNehaXmyFJvMGiTZDXN151hGMMw7pgrBuRzh").unwrap();
+    assert_eq!(
+        hash, expected,
+        "parsed blockhash must match what the Solana CLI reports for the same account"
+    );
+}
+
+/// The same live account, with only the state tag flipped to Uninitialized.
+/// Guards the check that a real account satisfies, so a regression cannot pass
+/// by accident on hand-built bytes alone.
+#[test]
+fn the_live_account_shape_still_fails_closed_when_uninitialized() {
+    use base64::Engine;
+    let mut raw = base64::engine::general_purpose::STANDARD
+        .decode(LIVE_NONCE_DATA_B64)
+        .unwrap();
+    raw[4..8].copy_from_slice(&0u32.to_le_bytes());
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":{{"lamports":10000000,"owner":"{SYSTEM_PROGRAM_ID}","data":["{b64}","base64"],"executable":false,"rentEpoch":0,"space":80}}}},"id":1}}"#
+    );
+    let err = parse_nonce_blockhash(&body).unwrap_err();
+    assert!(err.contains("not initialized"), "err: {err}");
+}
