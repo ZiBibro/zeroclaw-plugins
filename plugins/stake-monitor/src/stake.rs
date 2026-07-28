@@ -276,13 +276,38 @@ pub fn inflation_reward_body(pubkeys: &[String], epoch: u64) -> String {
 // ---------------------------------------------------------------------------
 // Response parsing
 // ---------------------------------------------------------------------------
+/// Longest upstream error text the report will carry.
+const MAX_UPSTREAM_MSG: usize = 160;
+
+/// Renders a message chosen by the RPC endpoint as an explicit quotation.
+///
+/// The `error.message` field of a JSON-RPC reply is written by whoever runs that
+/// endpoint, and it lands in text an LLM reads. An endpoint that is hostile,
+/// compromised, or sitting behind an interception proxy can put a sentence there
+/// and have it relayed into the agent's context verbatim. Marking the text as a
+/// quotation, stripping control characters that would break the report's line
+/// structure, and capping the length leaves the diagnostic value intact while
+/// denying the foothold.
+fn quote_upstream(msg: &str) -> String {
+    let cleaned: String = msg
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_UPSTREAM_MSG)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "upstream sent an empty message".to_string()
+    } else {
+        format!("upstream said: \"{trimmed}\"")
+    }
+}
 
 fn rpc_result(body: &str) -> Result<Value, String> {
     let root: Value =
         serde_json::from_str(body).map_err(|e| format!("RPC reply is not JSON: {e}"))?;
     if let Some(err) = root.get("error") {
         let msg = err.get("message").and_then(Value::as_str).unwrap_or("?");
-        return Err(format!("RPC error: {msg}"));
+        return Err(format!("RPC error, {}", quote_upstream(msg)));
     }
     root.get("result")
         .cloned()

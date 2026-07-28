@@ -59,6 +59,32 @@ pub fn gpa_request_body(authority_pubkey: &str) -> String {
     .to_string()
 }
 
+/// Longest upstream error text the report will carry.
+const MAX_UPSTREAM_MSG: usize = 160;
+
+/// Renders a message chosen by the RPC endpoint as an explicit quotation.
+///
+/// The `error.message` field of a JSON-RPC reply is written by whoever runs that
+/// endpoint, and it lands in text an LLM reads. An endpoint that is hostile,
+/// compromised, or sitting behind an interception proxy can put a sentence there
+/// and have it relayed into the agent's context verbatim. Marking the text as a
+/// quotation, stripping control characters that would break the report's line
+/// structure, and capping the length leaves the diagnostic value intact while
+/// denying the foothold.
+fn quote_upstream(msg: &str) -> String {
+    let cleaned: String = msg
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_UPSTREAM_MSG)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "upstream sent an empty message".to_string()
+    } else {
+        format!("upstream said: \"{trimmed}\"")
+    }
+}
+
 /// Parses a `getProgramAccounts` response into normalized positions, one per
 /// marginfi account. Accounts with no value on either side are skipped.
 pub fn parse_gpa_response(body: &str, wallet_label: &str) -> Result<Vec<Position>, String> {
@@ -66,7 +92,7 @@ pub fn parse_gpa_response(body: &str, wallet_label: &str) -> Result<Vec<Position
         serde_json::from_str(body).map_err(|e| format!("marginfi RPC reply is not JSON: {e}"))?;
     if let Some(err) = root.get("error") {
         let msg = err.get("message").and_then(Value::as_str).unwrap_or("?");
-        return Err(format!("marginfi RPC error: {msg}"));
+        return Err(format!("marginfi RPC error, {}", quote_upstream(msg)));
     }
     let Some(rows) = root.get("result").and_then(Value::as_array) else {
         return Err("marginfi RPC reply has no result array".to_string());
