@@ -187,6 +187,26 @@ mod component {
         }
     }
 
+    /// Turns a raw wasi-http failure into something an operator can act on.
+    ///
+    /// Plugins reach the network through `wasmtime-wasi-http`, whose bundled
+    /// request path trusts the webpki root set rather than the machine's own
+    /// certificate store. Antivirus HTTPS inspection (Avast, AVG, Kaspersky,
+    /// ESET) and corporate TLS-inspecting proxies present a certificate signed
+    /// by a CA they install into the OS store, which that root set does not
+    /// contain, so every outbound call fails. The bare code says nothing, and
+    /// the same machine's browser reaches the endpoint fine, which makes the
+    /// plugin look broken when the cause is entirely outside it.
+    fn explain_request_error(e: impl std::fmt::Display) -> String {
+        let raw = e.to_string();
+        if raw.contains("TlsProtocolError") {
+            return format!(
+                "{raw} (TLS refused: likely antivirus HTTPS inspection or a TLS-inspecting proxy, whose CA this runtime does not trust)"
+            );
+        }
+        raw
+    }
+
     fn post_json(url: &str, body: &str, timeout: Duration) -> Result<String, String> {
         let response = waki::Client::new()
             .post(url)
@@ -194,7 +214,7 @@ mod component {
             .header("Content-Type", "application/json")
             .body(body.as_bytes().to_vec())
             .send()
-            .map_err(|e| format!("request failed: {e}"))?;
+            .map_err(|e| format!("request failed: {}", explain_request_error(e)))?;
         let status = response.status_code();
         let bytes = response
             .body()
