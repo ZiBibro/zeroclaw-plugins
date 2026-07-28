@@ -543,3 +543,55 @@ fn a_marginfi_ltv_says_it_is_maintenance_weighted() {
     );
     assert!(!report.contains("maint"), "report: {report}");
 }
+
+/// Found on a live wallet during the demo rehearsal, 2026-07-28: a deposit-only
+/// Kamino position rendered as `[UNKNOWN] ... LTV 0.0% of 0.0% liq`.
+///
+/// Kamino reports both LTV and liquidation LTV as zero for a position carrying
+/// no debt, because no liquidation line exists to report. Reading that zero as
+/// an unmeasurable basis labelled the safest possible position UNKNOWN, and the
+/// rendered ratio read as a broken measurement. Liquidation triggers on debt
+/// over collateral; with no debt there is nothing to liquidate.
+#[test]
+fn a_position_with_no_debt_is_ok_not_unknown() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let deposit_only = Position {
+        wallet_label: "hedge".to_string(),
+        protocol: Protocol::Kamino,
+        market: "Vanilla@6WEG".to_string(),
+        account: "Cz3p..NQqK".to_string(),
+        deposit_usd: 843.0,
+        borrow_usd: 0.0,
+        liquidation: Some(Liquidation {
+            ltv: 0.0,
+            liquidation_ltv: 0.0,
+        }),
+        flagged_unhealthy: false,
+        stale_hint: Some("positions stale 1003 h".to_string()),
+    };
+    assert_eq!(classify_position(&deposit_only, &cfg), Risk::Ok);
+
+    let report = render_report(&[deposit_only], &cfg);
+    assert!(report.contains("no debt"), "report: {report}");
+    assert!(!report.contains("0.0% of 0.0%"), "report: {report}");
+    assert!(!report.contains("UNKNOWN"), "report: {report}");
+}
+
+/// The protocol's own unhealthy flag still outranks the no-debt shortcut: if
+/// the risk engine condemned the account, believe it rather than the arithmetic.
+#[test]
+fn a_condemned_account_stays_critical_even_with_no_debt() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let condemned = Position {
+        wallet_label: "hedge".to_string(),
+        protocol: Protocol::Marginfi,
+        market: "acct".to_string(),
+        account: "EN1W..K7ND".to_string(),
+        deposit_usd: 100.0,
+        borrow_usd: 0.0,
+        liquidation: None,
+        flagged_unhealthy: true,
+        stale_hint: None,
+    };
+    assert_eq!(classify_position(&condemned, &cfg), Risk::Critical);
+}

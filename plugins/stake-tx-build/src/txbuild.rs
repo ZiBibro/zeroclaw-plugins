@@ -982,8 +982,15 @@ pub fn build_transaction(
     // truncated address can be ground out to collide on its visible ends.
     // Kept to a single line: `output()` puts the summary on line one and the
     // base64 on line two, and callers split on that.
+    // The instruction against shortening is addressed at whatever relays this
+    // line to the operator. A chat agent will happily render
+    // `6ySLT...Gifp` for readability, and that undoes the reason the addresses
+    // are here: an attacker can grind a keypair whose address shares the
+    // visible head and tail, so an operator checking only the ends approves the
+    // wrong account. Observed live on 2026-07-28, where the model truncated both
+    // addresses in its own retelling.
     let mut summary = format!(
-        "Unsigned {} transaction, verify each address before signing: stake account {} (config label `{}`), fee payer and sole signer {}",
+        "Unsigned {} transaction. Verify each address below in full before signing, and do not abbreviate them when relaying: a shortened address can be ground to match on its visible ends. Stake account {} (config label `{}`), fee payer and sole signer {}",
         action.as_str(),
         stake.pubkey,
         stake.label,

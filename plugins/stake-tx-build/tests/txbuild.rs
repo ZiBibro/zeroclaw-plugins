@@ -967,3 +967,29 @@ fn the_summary_stays_on_one_line_in_every_variant() {
         assert_eq!(built.output().lines().count(), 2, "{}", built.output());
     }
 }
+
+/// Observed live during the demo rehearsal, 2026-07-28: the chat agent relayed
+/// our full addresses as `6ySLT...Gifp` and `8Xmdp...nn76`.
+///
+/// Truncation undoes the reason the addresses are in the summary at all. An
+/// attacker can grind a keypair whose address shares the visible head and tail,
+/// so an operator who checks only the ends approves the wrong account. The
+/// summary therefore carries the instruction against abbreviating, aimed at
+/// whatever relays it.
+#[test]
+fn the_summary_warns_against_abbreviating_addresses() {
+    let cfg = base_config();
+    let stake = cfg.resolve_stake("main").unwrap();
+    let built =
+        build_transaction(&cfg, Action::Deactivate, stake, None, blockhash_bytes()).unwrap();
+
+    assert!(
+        built.summary.contains("do not abbreviate"),
+        "{}",
+        built.summary
+    );
+    assert!(built.summary.contains("visible ends"), "{}", built.summary);
+    // The addresses themselves stay complete.
+    assert!(built.summary.contains(STAKE_ACC), "{}", built.summary);
+    assert!(built.summary.contains(AUTHORITY), "{}", built.summary);
+}

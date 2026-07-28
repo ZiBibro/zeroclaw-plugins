@@ -412,6 +412,15 @@ pub fn classify_position(position: &Position, cfg: &Config) -> Risk {
     if position.flagged_unhealthy {
         return Risk::Critical;
     }
+    // A position carrying no debt cannot be liquidated: liquidation triggers on
+    // debt over collateral, and that ratio is zero. Kamino reports such a
+    // position with a liquidation LTV of zero, since no line exists to report,
+    // and reading that as an unmeasurable basis would label the safest possible
+    // position UNKNOWN. Found on a live wallet: a deposit-only position rendered
+    // as "LTV 0.0% of 0.0% liq" under UNKNOWN.
+    if position.borrow_usd <= 0.0 {
+        return Risk::Ok;
+    }
     match position.liquidation {
         Some(l) => classify(l, cfg),
         None => Risk::Unknown,
@@ -571,14 +580,22 @@ fn render_within(positions: &[Position], cfg: &Config, cap: usize) -> String {
             .as_deref()
             .map(|s| format!(" ({s})"))
             .unwrap_or_default();
-        let distance = match p.liquidation {
-            Some(l) => format!(
-                "{}LTV {:.1}% of {:.1}% liq",
-                p.protocol.ltv_basis_prefix(),
-                l.ltv * 100.0,
-                l.liquidation_ltv * 100.0
-            ),
-            None => "LTV n/a".to_string(),
+        // A deposit-only position has no ratio worth printing: the protocol
+        // reports both its LTV and its liquidation line as zero, and
+        // "LTV 0.0% of 0.0% liq" reads as a broken measurement rather than as
+        // the safest state a position can be in.
+        let distance = if p.borrow_usd <= 0.0 {
+            "no debt".to_string()
+        } else {
+            match p.liquidation {
+                Some(l) => format!(
+                    "{}LTV {:.1}% of {:.1}% liq",
+                    p.protocol.ltv_basis_prefix(),
+                    l.ltv * 100.0,
+                    l.liquidation_ltv * 100.0
+                ),
+                None => "LTV n/a".to_string(),
+            }
         };
         lines.push(format!(
             "[{}] {} {} {} #{}: deposit ${:.0}, borrow ${:.0}, {}{}",
