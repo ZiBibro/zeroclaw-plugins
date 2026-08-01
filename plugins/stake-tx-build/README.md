@@ -138,10 +138,28 @@ defenses do not depend on the agent behaving.
 - **Unexpected arguments fail closed.** The argument schema rejects any field it
   does not recognize, so a smuggled parameter aborts the call.
 
-The tool does not check whether a validator is healthy or delinquent before it
-delegates. That judgment stays with the operator's allowlist and with
-`stake-monitor`. This builder's job ends at an unsigned transaction that is
-correct and confined to the allowlist.
+- **A stale allowlist entry is named, not silently honoured.** The allowlist
+  decides which validators are acceptable, and it keeps deciding that forever:
+  an entry added months ago cannot notice that its validator stopped voting last
+  week. Before building a `delegate`, the tool reads `getVoteAccounts` filtered
+  to that one vote account and puts the standing in the summary. A validator the
+  chain lists as delinquent, or one that appears in neither list, produces a
+  warning next to the address it describes. A currently voting validator adds
+  nothing to the line, because a summary that comments on every healthy case
+  teaches the reader to skip the sentence that matters. A lookup that fails says
+  so rather than reading as a clean bill of health.
+
+  This warns and does not refuse, which is a deliberate difference from the
+  official Solana CLI. The CLI rejects the delegation outright
+  (`Unable to delegate. Vote account appears delinquent`) with no override flag.
+  An operator may be delegating to a validator they know is coming back, and a
+  hard refusal here would strand them with no way through short of editing
+  config. The enforcement boundary stays where the operator put it, in the
+  allowlist, and the tool's job is to make sure they are not deciding blind.
+
+The health reading stops there. Commission, vote lag, and epoch rewards belong
+to `stake-monitor`, which reads them for accounts the operator already holds;
+repeating them here would pad the one line a human has to read before signing.
 
 ## A worked example
 

@@ -479,6 +479,69 @@ pub fn nonce_account_body(pubkey: &str) -> String {
     })
     .to_string()
 }
+
+/// One vote account, filtered server-side so the reply stays small instead of
+/// carrying the whole validator roster.
+pub fn vote_account_body(vote_pubkey: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "getVoteAccounts",
+        "params": [{ "votePubkey": vote_pubkey }]
+    })
+    .to_string()
+}
+
+/// Where the chain currently files a delegation target.
+///
+/// The allowlist is the enforcement boundary and it stays that way: an operator
+/// decided, once, which validators they are willing to back. What the allowlist
+/// cannot do is age. A validator entered months ago can stop voting tomorrow,
+/// and the allowlist keeps saying yes. Solana's own CLI refuses the delegation
+/// outright in that state (`Unable to delegate. Vote account appears
+/// delinquent`), so an operator who has used the CLI expects the subject to come
+/// up. This builder reports the standing in the summary and leaves the decision
+/// where it belongs, because the operator may be delegating to a validator they
+/// know is coming back, and a hard refusal here would strand them with no way
+/// through short of editing config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoterStanding {
+    /// The RPC lists the vote account among current voters.
+    Current,
+    /// The RPC lists it among delinquent voters: it has stopped voting.
+    Delinquent,
+    /// The roster came back without this vote account in either list.
+    Absent,
+    /// The standing could not be read. A failed lookup is not evidence of
+    /// health, and it is rendered as its own case rather than folded into
+    /// `Current`, which would turn a network problem into a clean bill.
+    Unread,
+}
+
+/// Reads a `getVoteAccounts` reply filtered by `votePubkey`.
+///
+/// Only the standing is taken. Commission and vote lag belong to the monitoring
+/// tool, which reads them for accounts the operator already holds; repeating
+/// them in a pre-signing summary would pad the one line a human has to read.
+pub fn parse_voter_standing(body: &str, voter: &str) -> Result<VoterStanding, String> {
+    let r = rpc_result(body)?;
+    let listed = |list: &str| -> bool {
+        r.get(list)
+            .and_then(Value::as_array)
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|v| v.get("votePubkey").and_then(Value::as_str) == Some(voter))
+            })
+    };
+    // Current is checked first: a validator that resumed voting can briefly
+    // appear in both lists, and the recovering case is the truthful one.
+    if listed("current") {
+        return Ok(VoterStanding::Current);
+    }
+    if listed("delinquent") {
+        return Ok(VoterStanding::Delinquent);
+    }
+    Ok(VoterStanding::Absent)
+}
 /// Longest upstream error text the report will carry.
 const MAX_UPSTREAM_MSG: usize = 160;
 
@@ -987,6 +1050,7 @@ pub fn build_transaction(
     stake: &StakeAccountRef,
     vote: Option<&str>,
     blockhash: [u8; 32],
+    standing: Option<VoterStanding>,
 ) -> Result<Built, String> {
     let authority = decode_pubkey(&cfg.authority)?;
     let stake_key = decode_pubkey(&stake.pubkey)?;
@@ -1054,6 +1118,23 @@ pub fn build_transaction(
     );
     if let Some(v) = &voter {
         summary.push_str(&format!(", vote account {v}"));
+        // The standing goes next to the address it describes, so an operator
+        // scanning the line meets the warning before the lifetime clause and
+        // the base64. Nothing is said when the validator is currently voting:
+        // a summary that comments on every healthy case teaches the reader to
+        // skip the sentence that matters.
+        match standing {
+            Some(VoterStanding::Delinquent) => summary.push_str(
+                " (WARNING: this vote account is currently listed as DELINQUENT, meaning it has stopped voting; stake delegated to it earns nothing until it recovers, and the official Solana CLI refuses this delegation outright)",
+            ),
+            Some(VoterStanding::Absent) => summary.push_str(
+                " (WARNING: this vote account appears in neither the current nor the delinquent validator list, so the chain does not know it as a voting validator at all)",
+            ),
+            Some(VoterStanding::Unread) => summary.push_str(
+                " (note: the validator's standing could not be read, so this transaction was built without confirming the target is still voting)",
+            ),
+            Some(VoterStanding::Current) | None => {}
+        }
     }
     if let Some(nonce) = &cfg.nonce {
         summary.push_str(&format!(

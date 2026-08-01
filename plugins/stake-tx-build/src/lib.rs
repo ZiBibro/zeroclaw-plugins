@@ -164,7 +164,29 @@ mod component {
                 }
             };
 
-            let built = match build_transaction(&cfg, action, stake, vote.as_deref(), blockhash) {
+            // Delegation-target standing. The allowlist is what enforces which
+            // validators are acceptable, and it is static: a validator added
+            // months ago can have stopped voting since. This read tells the
+            // operator that before they sign, and it deliberately does not
+            // refuse. A failed read is reported as unread rather than swallowed,
+            // so a network problem never reads as a clean bill of health.
+            let standing = vote.as_deref().map(|v| {
+                match post_json(&cfg.rpc_url, &txbuild::vote_account_body(v), timeout)
+                    .and_then(|b| txbuild::parse_voter_standing(&b, v))
+                {
+                    Ok(s) => s,
+                    Err(_) => txbuild::VoterStanding::Unread,
+                }
+            });
+
+            let built = match build_transaction(
+                &cfg,
+                action,
+                stake,
+                vote.as_deref(),
+                blockhash,
+                standing,
+            ) {
                 Ok(b) => b,
                 Err(e) => return fail(format!("transaction build failed: {e}")),
             };

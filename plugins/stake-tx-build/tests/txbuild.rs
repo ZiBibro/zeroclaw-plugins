@@ -6,10 +6,11 @@ use stake_tx_build::txbuild::{
     build_transaction, compile_message, deactivate_instruction, decode_compact_u16, decode_pubkey,
     delegate_stake_instruction, encode_compact_u16, genesis_hash_body, latest_blockhash_body,
     nonce_account_body, parse_action, parse_genesis_hash, parse_latest_blockhash,
-    parse_nonce_blockhash, serialize_message, serialize_transaction, validate_vote, verify_cluster,
-    Action, Cluster, Config, StakeAccountRef, DEVNET_GENESIS_HASH, MAINNET_GENESIS_HASH,
-    STAKE_CONFIG_ID, STAKE_PROGRAM_ID, SYSTEM_PROGRAM_ID, SYSVAR_CLOCK_ID,
-    SYSVAR_RECENT_BLOCKHASHES_ID, SYSVAR_STAKE_HISTORY_ID, TESTNET_GENESIS_HASH,
+    parse_nonce_blockhash, parse_voter_standing, serialize_message, serialize_transaction,
+    validate_vote, verify_cluster, vote_account_body, Action, Cluster, Config, StakeAccountRef,
+    VoterStanding, DEVNET_GENESIS_HASH, MAINNET_GENESIS_HASH, STAKE_CONFIG_ID, STAKE_PROGRAM_ID,
+    SYSTEM_PROGRAM_ID, SYSVAR_CLOCK_ID, SYSVAR_RECENT_BLOCKHASHES_ID, SYSVAR_STAKE_HISTORY_ID,
+    TESTNET_GENESIS_HASH,
 };
 
 /// Raw mainnet `getTransaction` reply for the delegate transaction at slot
@@ -623,8 +624,15 @@ fn decode_tx(bytes: &[u8]) -> DecodedTx {
 fn deactivate_builds_expected_wire_transaction() {
     let cfg = base_config();
     let stake = cfg.resolve_stake("main").unwrap();
-    let built =
-        build_transaction(&cfg, Action::Deactivate, stake, None, blockhash_bytes()).unwrap();
+    let built = build_transaction(
+        &cfg,
+        Action::Deactivate,
+        stake,
+        None,
+        blockhash_bytes(),
+        None,
+    )
+    .unwrap();
 
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&built.tx_base64)
@@ -696,6 +704,7 @@ fn delegate_builds_and_reports_voter() {
         stake,
         Some(VOTE_ACC),
         blockhash_bytes(),
+        None,
     )
     .unwrap();
     let bytes = base64::engine::general_purpose::STANDARD
@@ -720,7 +729,8 @@ fn durable_variant_prepends_advance_nonce_and_uses_nonce_blockhash() {
     let parsed_hash = parse_nonce_blockhash(&body, AUTHORITY).unwrap();
     assert_eq!(parsed_hash, nonce_hash);
 
-    let built = build_transaction(&cfg, Action::Deactivate, stake, None, parsed_hash).unwrap();
+    let built =
+        build_transaction(&cfg, Action::Deactivate, stake, None, parsed_hash, None).unwrap();
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&built.tx_base64)
         .unwrap();
@@ -775,8 +785,15 @@ fn durable_variant_prepends_advance_nonce_and_uses_nonce_blockhash() {
 fn base64_round_trips_and_message_bytes_match() {
     let cfg = base_config();
     let stake = cfg.resolve_stake("main").unwrap();
-    let built =
-        build_transaction(&cfg, Action::Deactivate, stake, None, blockhash_bytes()).unwrap();
+    let built = build_transaction(
+        &cfg,
+        Action::Deactivate,
+        stake,
+        None,
+        blockhash_bytes(),
+        None,
+    )
+    .unwrap();
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&built.tx_base64)
         .unwrap();
@@ -821,6 +838,7 @@ fn build_transaction_end_to_end_via_refs() {
         stake,
         vote.as_deref(),
         blockhash_bytes(),
+        None,
     )
     .unwrap();
     let bytes = base64::engine::general_purpose::STANDARD
@@ -899,6 +917,7 @@ fn the_summary_names_the_addresses_that_are_actually_signed() {
         stake,
         Some(VOTE_ACC),
         blockhash_bytes(),
+        None,
     )
     .unwrap();
 
@@ -932,8 +951,15 @@ fn a_separate_nonce_authority_is_named_as_a_second_signer() {
     s.insert("nonce_authority".to_string(), STAKE_ACC.to_string());
     let cfg = Config::from_section(&s).expect("split-authority nonce config");
     let stake = cfg.resolve_stake("main").unwrap();
-    let built =
-        build_transaction(&cfg, Action::Deactivate, stake, None, blockhash_bytes()).unwrap();
+    let built = build_transaction(
+        &cfg,
+        Action::Deactivate,
+        stake,
+        None,
+        blockhash_bytes(),
+        None,
+    )
+    .unwrap();
 
     assert!(
         !built.summary.contains("sole signer"),
@@ -967,8 +993,15 @@ fn a_separate_nonce_authority_is_named_as_a_second_signer() {
 fn a_shared_nonce_authority_still_reads_as_a_sole_signer() {
     let cfg = durable_config();
     let stake = cfg.resolve_stake("main").unwrap();
-    let built =
-        build_transaction(&cfg, Action::Deactivate, stake, None, blockhash_bytes()).unwrap();
+    let built = build_transaction(
+        &cfg,
+        Action::Deactivate,
+        stake,
+        None,
+        blockhash_bytes(),
+        None,
+    )
+    .unwrap();
     assert!(
         built.summary.contains("fee payer and sole signer"),
         "{}",
@@ -1050,7 +1083,7 @@ fn the_summary_stays_on_one_line_in_every_variant() {
     ];
     for (cfg, action, vote) in cases {
         let stake = cfg.resolve_stake("main").unwrap();
-        let built = build_transaction(&cfg, action, stake, vote, blockhash_bytes()).unwrap();
+        let built = build_transaction(&cfg, action, stake, vote, blockhash_bytes(), None).unwrap();
         assert!(
             !built.summary.contains('\n'),
             "summary broke into lines: {}",
@@ -1072,8 +1105,15 @@ fn the_summary_stays_on_one_line_in_every_variant() {
 fn the_summary_warns_against_abbreviating_addresses() {
     let cfg = base_config();
     let stake = cfg.resolve_stake("main").unwrap();
-    let built =
-        build_transaction(&cfg, Action::Deactivate, stake, None, blockhash_bytes()).unwrap();
+    let built = build_transaction(
+        &cfg,
+        Action::Deactivate,
+        stake,
+        None,
+        blockhash_bytes(),
+        None,
+    )
+    .unwrap();
 
     assert!(
         built.summary.contains("do not abbreviate"),
@@ -1164,4 +1204,171 @@ fn the_live_account_shape_still_fails_closed_when_uninitialized() {
     );
     let err = parse_nonce_blockhash(&body, LIVE_NONCE_AUTHORITY).unwrap_err();
     assert!(err.contains("not initialized"), "err: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// Delegation-target standing
+//
+// The allowlist decides which validators are acceptable and keeps deciding
+// that forever; it cannot notice that one of them stopped voting last week.
+// These cover the reading of that state and how it reaches the operator.
+// ---------------------------------------------------------------------------
+
+/// A roster reply carrying `voter` in the named list, plus an unrelated
+/// validator in the other one so a parser that ignores `votePubkey` fails.
+fn roster(list: &str, voter: &str) -> String {
+    let other = if list == "current" {
+        "delinquent"
+    } else {
+        "current"
+    };
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": 1,
+        "result": {
+            list: [{ "votePubkey": voter, "lastVote": 1000, "commission": 5 }],
+            other: [{ "votePubkey": OTHER_VOTE, "lastVote": 900, "commission": 10 }],
+        }
+    })
+    .to_string()
+}
+
+fn delegate_summary(standing: Option<VoterStanding>) -> String {
+    let cfg = base_config();
+    let stake = cfg.resolve_stake("main").unwrap();
+    build_transaction(
+        &cfg,
+        Action::Delegate,
+        stake,
+        Some(VOTE_ACC),
+        blockhash_bytes(),
+        standing,
+    )
+    .unwrap()
+    .summary
+}
+
+#[test]
+fn vote_account_body_filters_server_side() {
+    let v: Value = serde_json::from_str(&vote_account_body(VOTE_ACC)).unwrap();
+    assert_eq!(v["method"], "getVoteAccounts");
+    assert_eq!(v["params"][0]["votePubkey"], VOTE_ACC);
+}
+
+#[test]
+fn a_voting_validator_reads_as_current() {
+    let got = parse_voter_standing(&roster("current", VOTE_ACC), VOTE_ACC).unwrap();
+    assert_eq!(got, VoterStanding::Current);
+}
+
+#[test]
+fn a_stopped_validator_reads_as_delinquent() {
+    let got = parse_voter_standing(&roster("delinquent", VOTE_ACC), VOTE_ACC).unwrap();
+    assert_eq!(got, VoterStanding::Delinquent);
+}
+
+#[test]
+fn a_validator_in_neither_list_reads_as_absent() {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1,
+        "result": { "current": [], "delinquent": [] }
+    })
+    .to_string();
+    assert_eq!(
+        parse_voter_standing(&body, VOTE_ACC).unwrap(),
+        VoterStanding::Absent
+    );
+}
+
+/// A validator that just resumed voting can appear in both lists for a moment.
+/// The recovering reading is the truthful one, so `current` wins.
+#[test]
+fn a_validator_in_both_lists_reads_as_current() {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1,
+        "result": {
+            "current": [{ "votePubkey": VOTE_ACC, "lastVote": 1000 }],
+            "delinquent": [{ "votePubkey": VOTE_ACC, "lastVote": 300 }],
+        }
+    })
+    .to_string();
+    assert_eq!(
+        parse_voter_standing(&body, VOTE_ACC).unwrap(),
+        VoterStanding::Current
+    );
+}
+
+#[test]
+fn a_delinquent_target_is_called_out_before_signing() {
+    let summary = delegate_summary(Some(VoterStanding::Delinquent));
+    assert!(summary.contains("DELINQUENT"), "{summary}");
+    assert!(summary.contains("earns nothing"), "{summary}");
+    // The warning belongs to the address it describes, so both must be present
+    // and the operator must not have to infer which validator is meant.
+    assert!(summary.contains(VOTE_ACC), "{summary}");
+}
+
+#[test]
+fn an_unknown_target_is_called_out_before_signing() {
+    let summary = delegate_summary(Some(VoterStanding::Absent));
+    assert!(
+        summary.contains("neither the current nor the delinquent"),
+        "{summary}"
+    );
+}
+
+/// A failed lookup must never render as a clean bill of health.
+#[test]
+fn an_unread_standing_says_so_rather_than_implying_health() {
+    let summary = delegate_summary(Some(VoterStanding::Unread));
+    assert!(summary.contains("could not be read"), "{summary}");
+    assert!(!summary.contains("DELINQUENT"), "{summary}");
+}
+
+/// A summary that comments on every healthy case trains the reader to skip the
+/// sentence that matters, so a currently voting validator adds nothing.
+#[test]
+fn a_healthy_target_adds_no_noise() {
+    let quiet = delegate_summary(Some(VoterStanding::Current));
+    let absent = delegate_summary(None);
+    assert_eq!(quiet, absent);
+    assert!(!quiet.contains("WARNING"), "{quiet}");
+    assert!(!quiet.contains("could not be read"), "{quiet}");
+}
+
+/// `output()` puts the summary on line one and the base64 on line two, and
+/// callers split on that. The warning text must not break the invariant.
+#[test]
+fn the_warning_keeps_the_summary_on_one_line() {
+    for standing in [
+        VoterStanding::Current,
+        VoterStanding::Delinquent,
+        VoterStanding::Absent,
+        VoterStanding::Unread,
+    ] {
+        let summary = delegate_summary(Some(standing));
+        assert!(
+            !summary.contains('\n'),
+            "summary broke into lines for {standing:?}: {summary}"
+        );
+    }
+}
+
+/// Deactivation has no delegation target, so a standing that somehow reached
+/// the builder must not add a line about a validator this transaction does not
+/// touch.
+#[test]
+fn deactivate_ignores_a_standing() {
+    let cfg = base_config();
+    let stake = cfg.resolve_stake("main").unwrap();
+    let built = build_transaction(
+        &cfg,
+        Action::Deactivate,
+        stake,
+        None,
+        blockhash_bytes(),
+        Some(VoterStanding::Delinquent),
+    )
+    .unwrap();
+    assert!(!built.summary.contains("DELINQUENT"), "{}", built.summary);
+    assert!(!built.summary.contains("vote account"), "{}", built.summary);
 }
