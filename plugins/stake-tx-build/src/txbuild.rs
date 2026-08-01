@@ -482,10 +482,18 @@ pub fn nonce_account_body(pubkey: &str) -> String {
 
 /// One vote account, filtered server-side so the reply stays small instead of
 /// carrying the whole validator roster.
+///
+/// `keepUnstakedDelinquents` is not optional here, despite the name suggesting
+/// a nicety. By default the RPC omits delinquent validators that hold no active
+/// stake, and on mainnet that is the overwhelming majority of them: a census
+/// during review found 6136 of 6148 delinquents hidden behind the default. A
+/// validator that stopped voting long enough to lose its stake is exactly the
+/// one an operator must not delegate to, and without this flag it comes back
+/// looking like an address the chain has never heard of.
 pub fn vote_account_body(vote_pubkey: &str) -> String {
     serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "getVoteAccounts",
-        "params": [{ "votePubkey": vote_pubkey }]
+        "params": [{ "votePubkey": vote_pubkey, "keepUnstakedDelinquents": true }]
     })
     .to_string()
 }
@@ -534,6 +542,12 @@ pub enum StakeStanding {
     AlreadyDeactivating,
     /// The account carries no delegation record at all.
     NotDelegated,
+    /// The chain holds no stake account at this address: either nothing lives
+    /// there, or what lives there belongs to another program. This is an
+    /// established fact rather than a failure to look, so it stays distinct from
+    /// `Unread`. Folding it into `Unread` would soften "this cannot work" into
+    /// "we did not check".
+    Missing,
     /// The state could not be read. Rendered as its own case, never folded into
     /// `Delegated`, which would turn a network problem into a green light.
     Unread,
@@ -560,8 +574,23 @@ pub fn parse_stake_standing(body: &str) -> Result<StakeStanding, String> {
     let r = rpc_result(body)?;
     let value = r.get("value").ok_or("getAccountInfo reply has no value")?;
     if value.is_null() {
-        return Err("stake account does not exist on this cluster".to_string());
+        return Ok(StakeStanding::Missing);
     }
+    // Establish that this is a stake account before saying anything about its
+    // delegation. Without the owner gate every address answered "carries no
+    // delegation, so there is nothing to deactivate", including an ordinary
+    // wallet and an SPL token account, which is a claim about the chain the code
+    // never checked. `stake-monitor` already gates on the same two fields.
+    let owner = value.get("owner").and_then(Value::as_str).unwrap_or("");
+    let program = value
+        .get("data")
+        .and_then(|d| d.get("program"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if owner != STAKE_PROGRAM_ID || program != "stake" {
+        return Ok(StakeStanding::Missing);
+    }
+
     let delegation = value
         .get("data")
         .and_then(|d| d.get("parsed"))
@@ -593,21 +622,27 @@ pub fn parse_stake_standing(body: &str) -> Result<StakeStanding, String> {
 /// them in a pre-signing summary would pad the one line a human has to read.
 pub fn parse_voter_standing(body: &str, voter: &str) -> Result<VoterStanding, String> {
     let r = rpc_result(body)?;
-    let listed = |list: &str| -> bool {
-        r.get(list)
-            .and_then(Value::as_array)
-            .is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|v| v.get("votePubkey").and_then(Value::as_str) == Some(voter))
-            })
+    // Both rosters must be present and must be arrays before absence means
+    // anything. Without this gate a reply of `{}`, `[]`, `null` or a bare string
+    // fell through to `Absent`, and the operator read "the chain does not know
+    // this validator at all" about an address the code never looked up. An
+    // unreadable answer is an unread answer, and the caller renders that
+    // honestly.
+    let roster = |list: &str| -> Option<&Vec<Value>> { r.get(list).and_then(Value::as_array) };
+    let (Some(current), Some(delinquent)) = (roster("current"), roster("delinquent")) else {
+        return Err("getVoteAccounts reply carries no current/delinquent rosters".to_string());
+    };
+    let holds = |entries: &Vec<Value>| -> bool {
+        entries
+            .iter()
+            .any(|v| v.get("votePubkey").and_then(Value::as_str) == Some(voter))
     };
     // Current is checked first: a validator that resumed voting can briefly
     // appear in both lists, and the recovering case is the truthful one.
-    if listed("current") {
+    if holds(current) {
         return Ok(VoterStanding::Current);
     }
-    if listed("delinquent") {
+    if holds(delinquent) {
         return Ok(VoterStanding::Delinquent);
     }
     Ok(VoterStanding::Absent)
@@ -1219,6 +1254,9 @@ pub fn build_transaction(
             ),
             Some(StakeStanding::NotDelegated) => summary.push_str(
                 " (WARNING: this stake account carries no delegation, so there is nothing to deactivate)",
+            ),
+            Some(StakeStanding::Missing) => summary.push_str(
+                " (WARNING: the configured cluster holds no stake account at this address, so this transaction cannot land; check the address in config and check that rpc_url points at the cluster you meant)",
             ),
             Some(StakeStanding::Unread) => summary.push_str(
                 " (note: the stake's on-chain state could not be read, so this transaction was built without confirming there is an active delegation to deactivate)",

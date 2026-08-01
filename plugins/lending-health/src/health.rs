@@ -465,12 +465,36 @@ pub struct Position {
 pub fn short_account(pubkey: &str) -> String {
     const HEAD: usize = 4;
     const TAIL: usize = 4;
-    let total = pubkey.chars().count();
-    if total <= HEAD + TAIL + 2 {
-        return pubkey.to_string();
+    // The value arrives from a third-party API and lands in a line an LLM reads,
+    // so it is narrowed to the base58 alphabet before anything else happens. A
+    // real account address survives untouched. A hostile string cannot bring
+    // newlines with it, and a newline is the whole attack here: the report is
+    // line-structured, so one smuggled break lets an attacker forge a position
+    // row that reads exactly like a real one. Everything outside the alphabet
+    // becomes a dot, which keeps the length visible instead of vanishing.
+    let safe: String = pubkey
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | 'I' | 'l') {
+                c
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    // Nothing survived the alphabet, so the value was never an address. Say so
+    // with the same placeholder the callers use for a missing field, rather than
+    // printing a row of dots that looks like a redaction.
+    if safe.chars().all(|c| c == '.') {
+        return "?".to_string();
     }
-    let head: String = pubkey.chars().take(HEAD).collect();
-    let tail: String = pubkey.chars().skip(total - TAIL).collect();
+    let total = safe.chars().count();
+    if total <= HEAD + TAIL + 2 {
+        return safe;
+    }
+    let head: String = safe.chars().take(HEAD).collect();
+    let tail: String = safe.chars().skip(total - TAIL).collect();
     format!("{head}..{tail}")
 }
 

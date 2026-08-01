@@ -1468,13 +1468,72 @@ fn an_account_without_a_delegation_reads_as_not_delegated() {
     );
 }
 
-/// A pubkey that holds no account at all is an error rather than a standing:
-/// nothing was established about it, and `NotDelegated` would be a claim.
+/// A pubkey that holds no account carries its own standing. It is an
+/// established fact, so it must not soften into `Unread`, and it is not
+/// `NotDelegated`, which would claim an account exists and lacks a delegation.
 #[test]
-fn a_missing_account_is_an_error_not_a_standing() {
+fn a_missing_account_reads_as_missing() {
     let body = r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":null},"id":1}"#;
-    let err = parse_stake_standing(body).unwrap_err();
-    assert!(err.contains("does not exist"), "err: {err}");
+    assert_eq!(parse_stake_standing(body).unwrap(), StakeStanding::Missing);
+}
+
+/// The owner gate. Before this, any address answered "carries no delegation,
+/// so there is nothing to deactivate", including an ordinary wallet, which is a
+/// claim about the chain the code never checked.
+#[test]
+fn an_address_owned_by_another_program_reads_as_missing() {
+    for (owner, program) in [
+        ("11111111111111111111111111111111", "system"),
+        ("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "spl-token"),
+    ] {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":{{"lamports":1,"owner":"{owner}","data":{{"program":"{program}","parsed":{{"info":{{}}}},"space":0}}}}}},"id":1}}"#
+        );
+        assert_eq!(
+            parse_stake_standing(&body).unwrap(),
+            StakeStanding::Missing,
+            "owner {owner} should not read as a stake account"
+        );
+    }
+}
+
+#[test]
+fn a_missing_stake_is_called_out_before_signing() {
+    let summary = deactivate_summary(Some(StakeStanding::Missing));
+    assert!(summary.contains("holds no stake account"), "{summary}");
+    assert!(summary.contains("cannot land"), "{summary}");
+}
+
+/// An unreadable roster is not evidence that a validator is unknown. Before
+/// this gate a reply of `{}`, `[]` or `null` fell through to `Absent`, and the
+/// operator read a claim about the chain that nobody had established.
+#[test]
+fn an_unreadable_roster_is_an_error_not_absence() {
+    for body in [
+        r#"{"jsonrpc":"2.0","result":{},"id":1}"#,
+        r#"{"jsonrpc":"2.0","result":[],"id":1}"#,
+        r#"{"jsonrpc":"2.0","result":{"current":[]},"id":1}"#,
+        r#"{"jsonrpc":"2.0","result":{"current":"none","delinquent":"none"},"id":1}"#,
+    ] {
+        assert!(
+            parse_voter_standing(body, VOTE_ACC).is_err(),
+            "reply should not have produced a standing: {body}"
+        );
+    }
+    // Both rosters present and empty is a real answer: the roster was read and
+    // this validator is in neither list.
+    let real = r#"{"jsonrpc":"2.0","result":{"current":[],"delinquent":[]},"id":1}"#;
+    assert_eq!(
+        parse_voter_standing(real, VOTE_ACC).unwrap(),
+        VoterStanding::Absent
+    );
+}
+
+/// The flag that stops the RPC from hiding delinquents with no active stake.
+#[test]
+fn vote_account_body_keeps_unstaked_delinquents() {
+    let v: Value = serde_json::from_str(&vote_account_body(VOTE_ACC)).unwrap();
+    assert_eq!(v["params"][0]["keepUnstakedDelinquents"], true);
 }
 
 #[test]

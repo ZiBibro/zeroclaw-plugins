@@ -437,8 +437,13 @@ pub fn parse_stake_account(body: &str) -> Result<StakeState, String> {
         .and_then(Value::as_str)
         .unwrap_or("");
     if program != "stake" {
+        // `program` comes from the RPC reply, so it is third-party text landing
+        // in an error an LLM reads. It is quoted through the same path as any
+        // other upstream string: control characters stripped, length capped,
+        // inner quotes folded so the wrapper cannot be closed early.
+        let program = quote_upstream(program);
         return Err(format!(
-            "account is owned by `{program}`; expected a stake account"
+            "account is not owned by the stake program ({program})"
         ));
     }
 

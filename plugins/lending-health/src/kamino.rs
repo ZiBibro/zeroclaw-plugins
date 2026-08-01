@@ -118,8 +118,23 @@ fn str_num(row: &Value, key: &str) -> Option<f64> {
     parsed.is_finite().then_some(parsed)
 }
 
+/// First four characters of a market address, narrowed to base58 first.
+///
+/// Four characters cannot carry an instruction, but they can carry newlines,
+/// and the report is line-structured: one smuggled break forges a row. The
+/// market address is third-party input like the tag beside it, so it gets the
+/// same treatment.
 fn short_pubkey(pk: &str) -> String {
-    pk.chars().take(4).collect()
+    pk.chars()
+        .take(4)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | 'I' | 'l') {
+                c
+            } else {
+                '.'
+            }
+        })
+        .collect()
 }
 
 /// Longest product tag the report will carry. Real tags are short words like
