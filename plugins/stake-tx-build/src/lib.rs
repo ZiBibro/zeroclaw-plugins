@@ -179,6 +179,27 @@ mod component {
                 }
             });
 
+            // The mirror of the check above, on the other action. A deactivate
+            // against a stake that already has one recorded is rejected by the
+            // Stake program with AlreadyDeactivated, and without this read the
+            // operator finds that out only after signing and paying the fee.
+            // Reproduced on devnet during the acceptance run.
+            let stake_standing = match action {
+                txbuild::Action::Deactivate => Some(
+                    match post_json(
+                        &cfg.rpc_url,
+                        &txbuild::stake_account_body(&stake.pubkey),
+                        timeout,
+                    )
+                    .and_then(|b| txbuild::parse_stake_standing(&b))
+                    {
+                        Ok(s) => s,
+                        Err(_) => txbuild::StakeStanding::Unread,
+                    },
+                ),
+                txbuild::Action::Delegate => None,
+            };
+
             let built = match build_transaction(
                 &cfg,
                 action,
@@ -186,6 +207,7 @@ mod component {
                 vote.as_deref(),
                 blockhash,
                 standing,
+                stake_standing,
             ) {
                 Ok(b) => b,
                 Err(e) => return fail(format!("transaction build failed: {e}")),

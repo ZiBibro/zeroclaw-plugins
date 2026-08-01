@@ -157,6 +157,23 @@ defenses do not depend on the agent behaving.
   config. The enforcement boundary stays where the operator put it, in the
   allowlist, and the tool's job is to make sure they are not deciding blind.
 
+- **A deactivation with nothing to deactivate is named too.** The same boundary
+  on the other action. Before building a `deactivate`, the tool reads the stake
+  account and checks whether a deactivation is already recorded. A stake that
+  finished cooling down is a perfectly healthy state, and asking the Stake
+  program to deactivate it again is rejected with `AlreadyDeactivated`. Without
+  the check the operator receives well-formed bytes, signs them in their wallet,
+  pays the fee, and learns the answer from a failed transaction. An account
+  carrying no delegation at all is called out the same way. An active
+  delegation adds nothing to the summary.
+
+  This one came from a live run rather than from reading: during the acceptance
+  session of 2026-08-01 a `deactivate` built for a cooled-down devnet account
+  simulated with `InstructionError: Custom(2)`. The bytes were correct, the
+  `AdvanceNonceAccount` ahead of them succeeded, and the operation was still
+  pointless. Both checks now come from the same principle: an allowlist states
+  ownership, not what the chain holds right now.
+
 The health reading stops there. Commission, vote lag, and epoch rewards belong
 to `stake-monitor`, which reads them for accounts the operator already holds;
 repeating them here would pad the one line a human has to read before signing.

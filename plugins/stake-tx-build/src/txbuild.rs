@@ -516,6 +516,76 @@ pub enum VoterStanding {
     Unread,
 }
 
+/// Where the chain currently files the stake account a `deactivate` would act
+/// on.
+///
+/// The allowlist says this account belongs to the operator. It cannot say
+/// whether deactivating it means anything today. A stake that already finished
+/// cooling down is a normal, healthy state, and asking the Stake program to
+/// deactivate it again is rejected with `AlreadyDeactivated`. Without this
+/// check the operator gets well-formed bytes, signs them in their wallet, pays
+/// the fee, and learns the answer from a failed transaction. Found exactly that
+/// way on devnet during a live rehearsal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StakeStanding {
+    /// Delegated to a validator with no deactivation requested.
+    Delegated,
+    /// A deactivation is already recorded, so the stake is cooling down or done.
+    AlreadyDeactivating,
+    /// The account carries no delegation record at all.
+    NotDelegated,
+    /// The state could not be read. Rendered as its own case, never folded into
+    /// `Delegated`, which would turn a network problem into a green light.
+    Unread,
+}
+
+/// One account, parsed by the RPC so the layout stays the node's problem.
+pub fn stake_account_body(pubkey: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
+        "params": [pubkey, { "encoding": "jsonParsed" }]
+    })
+    .to_string()
+}
+
+/// Reads the delegation lifecycle out of a `jsonParsed` stake account.
+///
+/// The numeric delegation fields arrive as decimal strings, and an active stake
+/// carries `deactivationEpoch` equal to `u64::MAX` rendered as a string. So the
+/// question "has a deactivation already been requested" is answered by that one
+/// field, without needing the current epoch and a second round trip: any value
+/// other than the sentinel means the operator, or someone holding the
+/// authority, already asked for this.
+pub fn parse_stake_standing(body: &str) -> Result<StakeStanding, String> {
+    let r = rpc_result(body)?;
+    let value = r.get("value").ok_or("getAccountInfo reply has no value")?;
+    if value.is_null() {
+        return Err("stake account does not exist on this cluster".to_string());
+    }
+    let delegation = value
+        .get("data")
+        .and_then(|d| d.get("parsed"))
+        .and_then(|p| p.get("info"))
+        .and_then(|i| i.get("stake"))
+        .and_then(|s| s.get("delegation"));
+
+    let Some(delegation) = delegation else {
+        return Ok(StakeStanding::NotDelegated);
+    };
+    let deactivation_epoch = delegation
+        .get("deactivationEpoch")
+        .and_then(Value::as_str)
+        .ok_or("delegation carries no deactivationEpoch")?
+        .parse::<u64>()
+        .map_err(|_| "deactivationEpoch is not a number".to_string())?;
+
+    if deactivation_epoch == u64::MAX {
+        Ok(StakeStanding::Delegated)
+    } else {
+        Ok(StakeStanding::AlreadyDeactivating)
+    }
+}
+
 /// Reads a `getVoteAccounts` reply filtered by `votePubkey`.
 ///
 /// Only the standing is taken. Commission and vote lag belong to the monitoring
@@ -1051,6 +1121,7 @@ pub fn build_transaction(
     vote: Option<&str>,
     blockhash: [u8; 32],
     standing: Option<VoterStanding>,
+    stake_standing: Option<StakeStanding>,
 ) -> Result<Built, String> {
     let authority = decode_pubkey(&cfg.authority)?;
     let stake_key = decode_pubkey(&stake.pubkey)?;
@@ -1134,6 +1205,25 @@ pub fn build_transaction(
                 " (note: the validator's standing could not be read, so this transaction was built without confirming the target is still voting)",
             ),
             Some(VoterStanding::Current) | None => {}
+        }
+    }
+    // The mirror of the voter check, on the other action. A delegate asks
+    // whether the target still votes; a deactivate asks whether there is
+    // anything to deactivate. Same boundary, same reason: the allowlist is a
+    // statement about ownership, not about what the chain holds right now.
+    // Silence on the healthy case for the same reason as above.
+    if action == Action::Deactivate {
+        match stake_standing {
+            Some(StakeStanding::AlreadyDeactivating) => summary.push_str(
+                " (WARNING: this stake already has a deactivation recorded on chain, so it is cooling down or already inactive; the Stake program rejects a second deactivation with AlreadyDeactivated, and signing this would cost a fee for a transaction that cannot land)",
+            ),
+            Some(StakeStanding::NotDelegated) => summary.push_str(
+                " (WARNING: this stake account carries no delegation, so there is nothing to deactivate)",
+            ),
+            Some(StakeStanding::Unread) => summary.push_str(
+                " (note: the stake's on-chain state could not be read, so this transaction was built without confirming there is an active delegation to deactivate)",
+            ),
+            Some(StakeStanding::Delegated) | None => {}
         }
     }
     if let Some(nonce) = &cfg.nonce {

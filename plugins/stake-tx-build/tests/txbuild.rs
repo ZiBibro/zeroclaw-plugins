@@ -6,11 +6,11 @@ use stake_tx_build::txbuild::{
     build_transaction, compile_message, deactivate_instruction, decode_compact_u16, decode_pubkey,
     delegate_stake_instruction, encode_compact_u16, genesis_hash_body, latest_blockhash_body,
     nonce_account_body, parse_action, parse_genesis_hash, parse_latest_blockhash,
-    parse_nonce_blockhash, parse_voter_standing, serialize_message, serialize_transaction,
-    validate_vote, verify_cluster, vote_account_body, Action, Cluster, Config, StakeAccountRef,
-    VoterStanding, DEVNET_GENESIS_HASH, MAINNET_GENESIS_HASH, STAKE_CONFIG_ID, STAKE_PROGRAM_ID,
-    SYSTEM_PROGRAM_ID, SYSVAR_CLOCK_ID, SYSVAR_RECENT_BLOCKHASHES_ID, SYSVAR_STAKE_HISTORY_ID,
-    TESTNET_GENESIS_HASH,
+    parse_nonce_blockhash, parse_stake_standing, parse_voter_standing, serialize_message,
+    serialize_transaction, stake_account_body, validate_vote, verify_cluster, vote_account_body,
+    Action, Cluster, Config, StakeAccountRef, StakeStanding, VoterStanding, DEVNET_GENESIS_HASH,
+    MAINNET_GENESIS_HASH, STAKE_CONFIG_ID, STAKE_PROGRAM_ID, SYSTEM_PROGRAM_ID, SYSVAR_CLOCK_ID,
+    SYSVAR_RECENT_BLOCKHASHES_ID, SYSVAR_STAKE_HISTORY_ID, TESTNET_GENESIS_HASH,
 };
 
 /// Raw mainnet `getTransaction` reply for the delegate transaction at slot
@@ -631,6 +631,7 @@ fn deactivate_builds_expected_wire_transaction() {
         None,
         blockhash_bytes(),
         None,
+        None,
     )
     .unwrap();
 
@@ -705,6 +706,7 @@ fn delegate_builds_and_reports_voter() {
         Some(VOTE_ACC),
         blockhash_bytes(),
         None,
+        None,
     )
     .unwrap();
     let bytes = base64::engine::general_purpose::STANDARD
@@ -729,8 +731,16 @@ fn durable_variant_prepends_advance_nonce_and_uses_nonce_blockhash() {
     let parsed_hash = parse_nonce_blockhash(&body, AUTHORITY).unwrap();
     assert_eq!(parsed_hash, nonce_hash);
 
-    let built =
-        build_transaction(&cfg, Action::Deactivate, stake, None, parsed_hash, None).unwrap();
+    let built = build_transaction(
+        &cfg,
+        Action::Deactivate,
+        stake,
+        None,
+        parsed_hash,
+        None,
+        None,
+    )
+    .unwrap();
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&built.tx_base64)
         .unwrap();
@@ -792,6 +802,7 @@ fn base64_round_trips_and_message_bytes_match() {
         None,
         blockhash_bytes(),
         None,
+        None,
     )
     .unwrap();
     let bytes = base64::engine::general_purpose::STANDARD
@@ -838,6 +849,7 @@ fn build_transaction_end_to_end_via_refs() {
         stake,
         vote.as_deref(),
         blockhash_bytes(),
+        None,
         None,
     )
     .unwrap();
@@ -918,6 +930,7 @@ fn the_summary_names_the_addresses_that_are_actually_signed() {
         Some(VOTE_ACC),
         blockhash_bytes(),
         None,
+        None,
     )
     .unwrap();
 
@@ -957,6 +970,7 @@ fn a_separate_nonce_authority_is_named_as_a_second_signer() {
         stake,
         None,
         blockhash_bytes(),
+        None,
         None,
     )
     .unwrap();
@@ -999,6 +1013,7 @@ fn a_shared_nonce_authority_still_reads_as_a_sole_signer() {
         stake,
         None,
         blockhash_bytes(),
+        None,
         None,
     )
     .unwrap();
@@ -1083,7 +1098,8 @@ fn the_summary_stays_on_one_line_in_every_variant() {
     ];
     for (cfg, action, vote) in cases {
         let stake = cfg.resolve_stake("main").unwrap();
-        let built = build_transaction(&cfg, action, stake, vote, blockhash_bytes(), None).unwrap();
+        let built =
+            build_transaction(&cfg, action, stake, vote, blockhash_bytes(), None, None).unwrap();
         assert!(
             !built.summary.contains('\n'),
             "summary broke into lines: {}",
@@ -1111,6 +1127,7 @@ fn the_summary_warns_against_abbreviating_addresses() {
         stake,
         None,
         blockhash_bytes(),
+        None,
         None,
     )
     .unwrap();
@@ -1242,6 +1259,7 @@ fn delegate_summary(standing: Option<VoterStanding>) -> String {
         Some(VOTE_ACC),
         blockhash_bytes(),
         standing,
+        None,
     )
     .unwrap()
     .summary
@@ -1353,6 +1371,178 @@ fn the_warning_keeps_the_summary_on_one_line() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stake standing before a deactivate
+//
+// The mirror of the voter check. Found on devnet during the acceptance run of
+// 2026-08-01: a deactivate built for an account that had already finished
+// cooling down produced perfect bytes that the Stake program rejected with
+// AlreadyDeactivated, after the operator would have signed and paid.
+// ---------------------------------------------------------------------------
+
+/// A `jsonParsed` stake account reply. `deactivation_epoch` is passed as the
+/// string the RPC actually sends; an active stake carries u64::MAX.
+fn stake_account_reply(deactivation_epoch: Option<&str>) -> String {
+    let stake = match deactivation_epoch {
+        Some(epoch) => serde_json::json!({
+            "creditsObserved": 4242,
+            "delegation": {
+                "activationEpoch": "1100",
+                "deactivationEpoch": epoch,
+                "stake": "1008000000",
+                "voter": VOTE_ACC,
+                "warmupCooldownRate": 0.25
+            }
+        }),
+        None => serde_json::json!({ "creditsObserved": 0 }),
+    };
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": 1,
+        "result": {
+            "context": { "slot": 1 },
+            "value": {
+                "data": {
+                    "parsed": { "info": { "stake": stake }, "type": "delegated" },
+                    "program": "stake",
+                    "space": 200
+                },
+                "executable": false,
+                "lamports": 1008000000,
+                "owner": STAKE_PROGRAM_ID,
+                "rentEpoch": 0
+            }
+        }
+    })
+    .to_string()
+}
+
+fn deactivate_summary(stake_standing: Option<StakeStanding>) -> String {
+    let cfg = base_config();
+    let stake = cfg.resolve_stake("main").unwrap();
+    build_transaction(
+        &cfg,
+        Action::Deactivate,
+        stake,
+        None,
+        blockhash_bytes(),
+        None,
+        stake_standing,
+    )
+    .unwrap()
+    .summary
+}
+
+#[test]
+fn stake_account_body_asks_for_the_parsed_form() {
+    let v: Value = serde_json::from_str(&stake_account_body(STAKE_ACC)).unwrap();
+    assert_eq!(v["method"], "getAccountInfo");
+    assert_eq!(v["params"][0], STAKE_ACC);
+    assert_eq!(v["params"][1]["encoding"], "jsonParsed");
+}
+
+/// The sentinel the RPC sends for a stake with no deactivation requested.
+#[test]
+fn an_active_delegation_reads_as_delegated() {
+    let body = stake_account_reply(Some("18446744073709551615"));
+    assert_eq!(
+        parse_stake_standing(&body).unwrap(),
+        StakeStanding::Delegated
+    );
+}
+
+#[test]
+fn a_recorded_deactivation_reads_as_already_deactivating() {
+    let body = stake_account_reply(Some("1112"));
+    assert_eq!(
+        parse_stake_standing(&body).unwrap(),
+        StakeStanding::AlreadyDeactivating
+    );
+}
+
+#[test]
+fn an_account_without_a_delegation_reads_as_not_delegated() {
+    let body = stake_account_reply(None);
+    assert_eq!(
+        parse_stake_standing(&body).unwrap(),
+        StakeStanding::NotDelegated
+    );
+}
+
+/// A pubkey that holds no account at all is an error rather than a standing:
+/// nothing was established about it, and `NotDelegated` would be a claim.
+#[test]
+fn a_missing_account_is_an_error_not_a_standing() {
+    let body = r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":null},"id":1}"#;
+    let err = parse_stake_standing(body).unwrap_err();
+    assert!(err.contains("does not exist"), "err: {err}");
+}
+
+#[test]
+fn a_stake_already_cooling_down_is_called_out_before_signing() {
+    let summary = deactivate_summary(Some(StakeStanding::AlreadyDeactivating));
+    assert!(summary.contains("AlreadyDeactivated"), "{summary}");
+    assert!(summary.contains("cost a fee"), "{summary}");
+}
+
+#[test]
+fn a_stake_with_no_delegation_is_called_out_before_signing() {
+    let summary = deactivate_summary(Some(StakeStanding::NotDelegated));
+    assert!(summary.contains("nothing to deactivate"), "{summary}");
+}
+
+#[test]
+fn an_unread_stake_state_says_so_rather_than_implying_health() {
+    let summary = deactivate_summary(Some(StakeStanding::Unread));
+    assert!(summary.contains("could not be read"), "{summary}");
+    assert!(!summary.contains("WARNING"), "{summary}");
+}
+
+#[test]
+fn an_active_stake_adds_no_noise_to_a_deactivate() {
+    let quiet = deactivate_summary(Some(StakeStanding::Delegated));
+    assert_eq!(quiet, deactivate_summary(None));
+    assert!(!quiet.contains("WARNING"), "{quiet}");
+}
+
+#[test]
+fn the_stake_warning_keeps_the_summary_on_one_line() {
+    for standing in [
+        StakeStanding::Delegated,
+        StakeStanding::AlreadyDeactivating,
+        StakeStanding::NotDelegated,
+        StakeStanding::Unread,
+    ] {
+        let summary = deactivate_summary(Some(standing));
+        assert!(
+            !summary.contains('\n'),
+            "summary broke into lines for {standing:?}: {summary}"
+        );
+    }
+}
+
+/// Delegation does not touch the stake's deactivation state, so a standing that
+/// reached the builder on that path must not add a line about it.
+#[test]
+fn delegate_ignores_a_stake_standing() {
+    let cfg = base_config();
+    let stake = cfg.resolve_stake("main").unwrap();
+    let built = build_transaction(
+        &cfg,
+        Action::Delegate,
+        stake,
+        Some(VOTE_ACC),
+        blockhash_bytes(),
+        None,
+        Some(StakeStanding::AlreadyDeactivating),
+    )
+    .unwrap();
+    assert!(
+        !built.summary.contains("AlreadyDeactivated"),
+        "{}",
+        built.summary
+    );
+}
+
 /// Deactivation has no delegation target, so a standing that somehow reached
 /// the builder must not add a line about a validator this transaction does not
 /// touch.
@@ -1367,6 +1557,7 @@ fn deactivate_ignores_a_standing() {
         None,
         blockhash_bytes(),
         Some(VoterStanding::Delinquent),
+        None,
     )
     .unwrap();
     assert!(!built.summary.contains("DELINQUENT"), "{}", built.summary);
