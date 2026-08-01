@@ -148,7 +148,7 @@ mod component {
                         &txbuild::nonce_account_body(&nonce.account),
                         timeout,
                     )
-                    .and_then(|b| txbuild::parse_nonce_blockhash(&b))
+                    .and_then(|b| txbuild::parse_nonce_blockhash(&b, &nonce.authority))
                     {
                         Ok(h) => h,
                         Err(e) => return fail(format!("nonce account read failed: {e}")),

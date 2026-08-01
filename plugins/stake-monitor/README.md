@@ -67,6 +67,11 @@ a printed lag is a floor, and the real distance can only be larger.
 
 ## Custody tier
 
+**Tier: T0 Read** on the ZeroClaw custody ladder. Secrets held: the operator's
+RPC endpoint URL and nothing besides, with no private key or seed phrase anywhere
+in config or code. The tier is honest because every JSON-RPC method this plugin
+can issue is a read method, and it carries no code that serializes an instruction.
+
 Read-only. The plugin holds no private keys and signs no transactions; it only
 reads public chain state through the operator's RPC endpoint. Nothing it exposes
 can move funds, redelegate, deactivate a stake account, or change an authority.
@@ -189,10 +194,12 @@ captured during verification.
 ## Install
 
 ```bash
-zeroclaw plugin install stake-monitor
+zeroclaw plugin install .   # from this directory, with the .wasm beside manifest.toml
 ```
 
-or copy this directory (the `.wasm` next to its `manifest.toml`) into your
+The path form is what works while the plugin lives outside a registry; `zeroclaw plugin install stake-monitor` resolves by name only once a registry serves it.
+
+Or copy this directory (the `.wasm` next to its `manifest.toml`) into your
 configured plugins dir, then enable plugins:
 
 ```toml
@@ -214,6 +221,11 @@ rpc_url = "https://your-own-rpc.example.com"
 vote_lag_warn_slots = "32"
 timeout_secs = "10"
 ```
+
+The address above is a live mainnet stake account, picked so the worked example
+resolves against real chain state. It belongs to a stranger, and `main:` is only
+the example label; replace both with your own account before running this.
+Reading it reveals nothing the chain does not already publish.
 
 Run the agent with a build that includes a compiler backend, e.g.
 `--features plugins-wasm,plugins-wasm-cranelift`. For runtime-only hosts

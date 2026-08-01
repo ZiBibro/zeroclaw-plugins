@@ -84,6 +84,13 @@ cp target/wasm32-wasip2/release/stake_tx_build.wasm stake_tx_build.wasm
 
 ## Custody tier
 
+**Tier: T1 Build** on the ZeroClaw custody ladder. Secrets held: the operator's
+RPC endpoint URL and nothing besides; the authority and the stake accounts it
+reads from config are public keys, and no config key would accept a private one.
+The tier is honest because the tool stops at a base64 message, with no signer and
+no `sendTransaction` path, so what it returns stays inert until a human signs it
+in a wallet the plugin never sees.
+
 This tool builds unsigned transactions and holds no keys. Its only outbound
 calls are reads against the operator's own RPC endpoint: the cluster genesis
 hash, then a blockhash or the nonce account state. Everything it produces is
@@ -142,7 +149,7 @@ A `deactivate` call against the stake account labeled `main`, with no durable
 nonce configured, returns:
 
 ```
-Unsigned deactivate transaction for stake `main`; amount not read by this builder; fresh blockhash: sign and submit within roughly 60 to 90 seconds.
+Unsigned deactivate transaction. Verify each address below in full before signing, and do not abbreviate them when relaying: a shortened address can be ground to match on its visible ends. Stake account CUupRKBoZ3WvHV24uBtCMXz3ms2geTad7g1k2ZpyqPmq (config label `main`), fee payer and sole signer AAJNL7uZrwcCFPAFJHRiSDEKXGgdZXhpL427iqkDFnre; lifetime: fresh blockhash, sign and submit within roughly 60 to 90 seconds; amount: not read by this builder.
 unsigned_tx_base64: AQAAAA...BAUAAAA
 ```
 
@@ -190,10 +197,12 @@ the error names the allowlist labels so a legitimate typo is easy to correct.
 ## Install
 
 ```bash
-zeroclaw plugin install stake-tx-build
+zeroclaw plugin install .   # from this directory, with the .wasm beside manifest.toml
 ```
 
-or copy this directory (the `.wasm` next to its `manifest.toml`) into your
+The path form is what works while the plugin lives outside a registry; `zeroclaw plugin install stake-tx-build` resolves by name only once a registry serves it.
+
+Or copy this directory (the `.wasm` next to its `manifest.toml`) into your
 configured plugins dir, then enable plugins and configure the keys above:
 
 ```toml

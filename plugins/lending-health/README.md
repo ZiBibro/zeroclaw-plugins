@@ -129,10 +129,12 @@ cp target/wasm32-wasip2/release/lending_health.wasm lending_health.wasm
 ## Install
 
 ```bash
-zeroclaw plugin install lending-health
+zeroclaw plugin install .   # from this directory, with the .wasm beside manifest.toml
 ```
 
-or copy this directory (the `.wasm` next to its `manifest.toml`) into your
+The path form is what works while the plugin lives outside a registry; `zeroclaw plugin install lending-health` resolves by name only once a registry serves it.
+
+Or copy this directory (the `.wasm` next to its `manifest.toml`) into your
 configured plugins dir, then enable plugins and configure the wallet allowlist:
 
 ```toml
@@ -147,6 +149,13 @@ Run the agent with a build that includes a compiler backend, e.g.
 and point `wasm_path` at the `.cwasm`.
 
 ## Custody tier
+
+**Tier: T0 Read** on the ZeroClaw custody ladder. Secrets held: the operator's
+RPC endpoint URL, which may carry a provider API key in its query string, and
+nothing besides. No private key or seed phrase is accepted by any config key or
+reachable from any code path. The tier is honest because the component carries no
+transaction encoder and no submit call, so the worst outcome of a total compromise
+is still a read.
 
 The tool only reads. It builds nothing, signs nothing, holds no key material,
 and moves no funds. Every call it makes is an HTTPS `GET` to the Kamino API or a

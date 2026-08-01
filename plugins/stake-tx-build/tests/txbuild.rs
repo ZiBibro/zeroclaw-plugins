@@ -298,9 +298,20 @@ fn nonce_body_with_hash(hash: &[u8; 32], owner: &str) -> String {
 /// at 40..72, fee calculator at 72..80. A live initialized account carries
 /// version 1 (`Versions::Current`) and state 1 (`State::Initialized`).
 fn nonce_body_with_tags(hash: &[u8; 32], owner: &str, version: u32, state: u32) -> String {
+    nonce_body_full(hash, owner, version, state, AUTHORITY)
+}
+
+fn nonce_body_full(
+    hash: &[u8; 32],
+    owner: &str,
+    version: u32,
+    state: u32,
+    authority: &str,
+) -> String {
     let mut data = vec![0u8; 80];
     data[0..4].copy_from_slice(&version.to_le_bytes());
     data[4..8].copy_from_slice(&state.to_le_bytes());
+    data[8..40].copy_from_slice(&decode_pubkey(authority).expect("authority pubkey"));
     data[40..72].copy_from_slice(hash);
     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
     format!(
@@ -312,14 +323,14 @@ fn nonce_body_with_tags(hash: &[u8; 32], owner: &str, version: u32, state: u32) 
 fn nonce_blockhash_reads_offset_40_to_72() {
     let expected: [u8; 32] = core::array::from_fn(|i| (i as u8) + 40);
     let body = nonce_body_with_hash(&expected, SYSTEM_PROGRAM_ID);
-    assert_eq!(parse_nonce_blockhash(&body).unwrap(), expected);
+    assert_eq!(parse_nonce_blockhash(&body, AUTHORITY).unwrap(), expected);
 }
 
 #[test]
 fn nonce_blockhash_rejects_foreign_owner() {
     let hash = [7u8; 32];
     let body = nonce_body_with_hash(&hash, STAKE_PROGRAM_ID);
-    let err = parse_nonce_blockhash(&body).unwrap_err();
+    let err = parse_nonce_blockhash(&body, AUTHORITY).unwrap_err();
     assert!(err.contains("expected the System program"), "err: {err}");
 }
 
@@ -329,7 +340,7 @@ fn nonce_blockhash_rejects_short_data() {
     let body = format!(
         r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":{{"lamports":1,"owner":"{SYSTEM_PROGRAM_ID}","data":["{b64}","base64"],"executable":false,"rentEpoch":0,"space":40}}}},"id":1}}"#
     );
-    assert!(parse_nonce_blockhash(&body).is_err());
+    assert!(parse_nonce_blockhash(&body, AUTHORITY).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -706,7 +717,7 @@ fn durable_variant_prepends_advance_nonce_and_uses_nonce_blockhash() {
     // recent blockhash queue.
     let nonce_hash: [u8; 32] = core::array::from_fn(|i| 0xA0u8.wrapping_add(i as u8));
     let body = nonce_body_with_hash(&nonce_hash, SYSTEM_PROGRAM_ID);
-    let parsed_hash = parse_nonce_blockhash(&body).unwrap();
+    let parsed_hash = parse_nonce_blockhash(&body, AUTHORITY).unwrap();
     assert_eq!(parsed_hash, nonce_hash);
 
     let built = build_transaction(&cfg, Action::Deactivate, stake, None, parsed_hash).unwrap();
@@ -829,7 +840,7 @@ fn build_transaction_end_to_end_via_refs() {
 #[test]
 fn an_uninitialized_nonce_account_is_refused() {
     let body = nonce_body_with_tags(&[0u8; 32], SYSTEM_PROGRAM_ID, 1, 0);
-    let err = parse_nonce_blockhash(&body).unwrap_err();
+    let err = parse_nonce_blockhash(&body, AUTHORITY).unwrap_err();
     assert!(err.contains("not initialized"), "err: {err}");
     assert!(err.contains("InitializeNonceAccount"), "err: {err}");
 }
@@ -842,7 +853,7 @@ fn an_uninitialized_nonce_account_is_refused() {
 fn a_legacy_version_nonce_account_is_refused() {
     let hash: [u8; 32] = core::array::from_fn(|i| (i as u8) + 1);
     let body = nonce_body_with_tags(&hash, SYSTEM_PROGRAM_ID, 0, 1);
-    let err = parse_nonce_blockhash(&body).unwrap_err();
+    let err = parse_nonce_blockhash(&body, AUTHORITY).unwrap_err();
     assert!(err.contains("version tag 0"), "err: {err}");
 }
 
@@ -852,8 +863,26 @@ fn a_legacy_version_nonce_account_is_refused() {
 #[test]
 fn an_all_zero_nonce_is_refused_even_with_valid_tags() {
     let body = nonce_body_with_tags(&[0u8; 32], SYSTEM_PROGRAM_ID, 1, 1);
-    let err = parse_nonce_blockhash(&body).unwrap_err();
+    let err = parse_nonce_blockhash(&body, AUTHORITY).unwrap_err();
     assert!(err.contains("all-zero nonce"), "err: {err}");
+}
+
+/// `AdvanceNonceAccount` is authorized by the key the chain records against the
+/// account, while the instruction this builder emits names the key the config
+/// carries. When they disagree the transaction cannot land, and the operator
+/// would spend an approval on bytes that were dead before they were signed.
+/// Both keys are named so the operator can see which one to correct.
+#[test]
+fn a_nonce_account_owned_by_another_authority_is_refused() {
+    let hash: [u8; 32] = core::array::from_fn(|i| (i as u8) + 9);
+    let body = nonce_body_full(&hash, SYSTEM_PROGRAM_ID, 1, 1, STAKE_ACC);
+    let err = parse_nonce_blockhash(&body, AUTHORITY).unwrap_err();
+    assert!(err.contains(STAKE_ACC), "on-chain authority missing: {err}");
+    assert!(
+        err.contains(AUTHORITY),
+        "configured authority missing: {err}"
+    );
+    assert!(err.contains("nonce_authority"), "err: {err}");
 }
 
 /// The summary is the last thing a human reads before signing. Naming only the
@@ -887,6 +916,69 @@ fn the_summary_names_the_addresses_that_are_actually_signed() {
     }
     // The label stays, as a convenience, alongside the address it resolved to.
     assert!(built.summary.contains("`main`"), "{}", built.summary);
+}
+
+/// A nonce authority held on its own key makes `AdvanceNonceAccount` a second
+/// signer, and `compile_message` reserves the extra signature slot. The summary
+/// must follow the bytes: telling the operator they are the sole signer would
+/// promise that approval ends with them, while the transaction still waits on a
+/// key they may not hold.
+#[test]
+fn a_separate_nonce_authority_is_named_as_a_second_signer() {
+    let mut s = base_section();
+    s.insert("nonce_account".to_string(), NONCE_ACC.to_string());
+    // The stake account doubles as a stand-in for a nonce authority held apart
+    // from the fee payer; only its distinctness from AUTHORITY matters here.
+    s.insert("nonce_authority".to_string(), STAKE_ACC.to_string());
+    let cfg = Config::from_section(&s).expect("split-authority nonce config");
+    let stake = cfg.resolve_stake("main").unwrap();
+    let built =
+        build_transaction(&cfg, Action::Deactivate, stake, None, blockhash_bytes()).unwrap();
+
+    assert!(
+        !built.summary.contains("sole signer"),
+        "two signatures are required, so the summary must not claim a sole signer: {}",
+        built.summary
+    );
+    assert!(
+        built.summary.contains("2 required signatures"),
+        "summary hides the second signature: {}",
+        built.summary
+    );
+    assert!(
+        built.summary.contains("must sign this transaction too"),
+        "summary does not say the nonce authority signs: {}",
+        built.summary
+    );
+
+    // The wire bytes and the sentence must agree, so the header is read back.
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&built.tx_base64)
+        .expect("base64");
+    // compact-u16 signature count, then that many 64-byte zero slots, then the
+    // message header whose first byte is num_required_signatures.
+    assert_eq!(raw[0], 2, "signature slots in the wire transaction");
+    assert_eq!(raw[1 + 64 * 2], 2, "num_required_signatures in the header");
+}
+
+/// The single-signer wording stays put when the nonce authority is the fee
+/// payer, which is the ordinary setup and the one the demo stand runs.
+#[test]
+fn a_shared_nonce_authority_still_reads_as_a_sole_signer() {
+    let cfg = durable_config();
+    let stake = cfg.resolve_stake("main").unwrap();
+    let built =
+        build_transaction(&cfg, Action::Deactivate, stake, None, blockhash_bytes()).unwrap();
+    assert!(
+        built.summary.contains("fee payer and sole signer"),
+        "{}",
+        built.summary
+    );
+    assert!(
+        !built.summary.contains("must sign this transaction too"),
+        "{}",
+        built.summary
+    );
 }
 
 /// `resolve_stake` matches a label or a pubkey in one namespace, so a label that
@@ -1037,6 +1129,7 @@ fn a_hostile_rpc_error_message_is_quoted_and_bounded() {
 /// This replaces guesswork with evidence: the hand-built fixtures for this path
 /// originally carried version tag 0, a shape the runtime refuses outright, so
 /// the parser had been exercised against data no validator would accept.
+const LIVE_NONCE_AUTHORITY: &str = "AAJNL7uZrwcCFPAFJHRiSDEKXGgdZXhpL427iqkDFnre";
 const LIVE_NONCE_DATA_B64: &str = "AQAAAAEAAACIGwwiWM39onCxWlEpQr9tof+YeSLPdx1nrOr63vY148aBRJYjgaaxyZUb3uhRUeeHh8zlqbd6RcqKTzr/c6ISiBMAAAAAAAA=";
 
 #[test]
@@ -1045,7 +1138,8 @@ fn the_parser_reads_a_real_live_nonce_account() {
         r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":{{"lamports":10000000,"owner":"{SYSTEM_PROGRAM_ID}","data":["{LIVE_NONCE_DATA_B64}","base64"],"executable":false,"rentEpoch":0,"space":80}}}},"id":1}}"#
     );
 
-    let hash = parse_nonce_blockhash(&body).expect("a live nonce account must parse");
+    let hash = parse_nonce_blockhash(&body, LIVE_NONCE_AUTHORITY)
+        .expect("a live nonce account must parse");
     // The value `solana nonce-account` printed for this account.
     let expected = decode_pubkey("EMt3s382UNehaXmyFJvMGiTZDXN151hGMMw7pgrBuRzh").unwrap();
     assert_eq!(
@@ -1068,6 +1162,6 @@ fn the_live_account_shape_still_fails_closed_when_uninitialized() {
     let body = format!(
         r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":{{"lamports":10000000,"owner":"{SYSTEM_PROGRAM_ID}","data":["{b64}","base64"],"executable":false,"rentEpoch":0,"space":80}}}},"id":1}}"#
     );
-    let err = parse_nonce_blockhash(&body).unwrap_err();
+    let err = parse_nonce_blockhash(&body, LIVE_NONCE_AUTHORITY).unwrap_err();
     assert!(err.contains("not initialized"), "err: {err}");
 }

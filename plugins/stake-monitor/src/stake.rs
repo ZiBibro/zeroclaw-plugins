@@ -289,9 +289,13 @@ const MAX_UPSTREAM_MSG: usize = 160;
 /// structure, and capping the length leaves the diagnostic value intact while
 /// denying the foothold.
 fn quote_upstream(msg: &str) -> String {
+    // The double quote is folded to a single one: the text is wrapped in
+    // quotation marks, and a quote inside it would close that wrapper early and
+    // let the rest of an upstream-chosen sentence read as our own words.
     let cleaned: String = msg
         .chars()
         .filter(|c| !c.is_control())
+        .map(|c| if c == '\"' { '\'' } else { c })
         .take(MAX_UPSTREAM_MSG)
         .collect();
     let trimmed = cleaned.trim();
@@ -753,8 +757,21 @@ fn render_within(entries: &[Entry], epoch: &EpochInfo, cfg: &Config, budget: usi
         return "No stake accounts to report.".to_string();
     }
 
+    // A cooled-down account keeps its delegation record on chain, with the
+    // deactivation epoch already behind us, so summing every record that exists
+    // reports stake as delegated after it has stopped being delegated. Observed
+    // on devnet on 2026-08-01: one active account of 1.099 SOL beside one the
+    // CLI called undelegated produced a header claiming 2.107 SOL delegated.
+    // Only the three states in which lamports are still committed to a
+    // validator count here.
     let total: u64 = entries
         .iter()
+        .filter(|e| {
+            matches!(
+                e.status,
+                StakeStatus::Activating | StakeStatus::Active | StakeStatus::Deactivating
+            )
+        })
         .map(|e| e.state.delegation.as_ref().map_or(0, |d| d.stake_lamports))
         .sum();
     let delinquent = entries
@@ -826,7 +843,16 @@ fn render_within(entries: &[Entry], epoch: &EpochInfo, cfg: &Config, budget: usi
                         fmt_vote_lag(v, epoch, cfg.vote_lag_warn_slots)
                     )
                 }
-                Some(ValidatorStatus::Unknown) => format!("validator {voter_short}.. not found"),
+                // `Unknown` covers two different situations: the roster came
+                // back and the vote account was in neither list, or the read
+                // failed and there is no roster to speak of. Saying "not found"
+                // asserts a fact about the chain in the second case, which the
+                // code never established. The wording states the absence of a
+                // reading, and the data-issues line carries the reason whenever
+                // there was one.
+                Some(ValidatorStatus::Unknown) => {
+                    format!("validator {voter_short}.. status unknown")
+                }
                 None => format!("validator {voter_short}.."),
             };
             parts.push(vstat);

@@ -102,12 +102,20 @@ fn parse_row(
 /// fixtures were captured. A JSON number is accepted too: the encoding is the
 /// upstream's choice, and reading only one of the two forms would turn a
 /// serialization change into silently dropped positions.
+/// Non-finite values are refused rather than carried. Rust's `f64` parser
+/// accepts `NaN`, `inf` and `-infinity`, and an overflowing literal such as
+/// `1e400` parses to infinity, so an upstream that sends one of those would put
+/// `$NaN` or `$inf` in front of an operator as though it were a measurement.
+/// Dropping the value here lets the caller report the position without a
+/// liquidation distance, which is the same honest path a missing field takes.
 fn str_num(row: &Value, key: &str) -> Option<f64> {
     let value = row.get(key)?;
-    if let Some(text) = value.as_str() {
-        return text.trim().parse::<f64>().ok();
-    }
-    value.as_f64()
+    let parsed = if let Some(text) = value.as_str() {
+        text.trim().parse::<f64>().ok()?
+    } else {
+        value.as_f64()?
+    };
+    parsed.is_finite().then_some(parsed)
 }
 
 fn short_pubkey(pk: &str) -> String {

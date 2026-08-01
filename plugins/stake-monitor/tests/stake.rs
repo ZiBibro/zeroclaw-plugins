@@ -422,6 +422,54 @@ fn healthy_validator() -> ValidatorStatus {
     }
 }
 
+/// A cooled-down account keeps its delegation record, so summing every record
+/// that exists counts lamports that are no longer committed to any validator.
+/// Seen on devnet on 2026-08-01: one active account beside one the Solana CLI
+/// called undelegated produced a header claiming both were delegated.
+#[test]
+fn the_header_counts_only_stake_still_committed_to_a_validator() {
+    let e = parse_epoch_info(EPOCH_INFO).unwrap();
+    let cfg = cfg();
+
+    let active_only = render_report(
+        &[entry("spare", StakeStatus::Active, healthy_validator())],
+        &e,
+        &cfg,
+    );
+    let with_cooled_down = render_report(
+        &[
+            entry("spare", StakeStatus::Active, healthy_validator()),
+            entry("main", StakeStatus::Inactive, healthy_validator()),
+        ],
+        &e,
+        &cfg,
+    );
+
+    // The delegated figure is read back out of the header rather than
+    // recomputed, so the test stays tied to what the operator actually sees.
+    let delegated = |report: &str| -> String {
+        let head = report.lines().next().expect("header line").to_string();
+        let start = head.find("account(s), ").expect("header shape") + "account(s), ".len();
+        let end = head[start..].find(" SOL delegated").expect("header shape") + start;
+        head[start..end].to_string()
+    };
+
+    assert_eq!(
+        delegated(&active_only),
+        delegated(&with_cooled_down),
+        "an inactive account must not add to the delegated total.\nactive only: {active_only}\nwith cooled down: {with_cooled_down}"
+    );
+    assert_ne!(
+        delegated(&active_only),
+        "0",
+        "the fixture must carry real delegated stake: {active_only}"
+    );
+    assert!(
+        with_cooled_down.contains("2 account(s)"),
+        "the account count still covers every allowlisted account: {with_cooled_down}"
+    );
+}
+
 #[test]
 fn report_flags_delinquent_in_header() {
     let e = parse_epoch_info(EPOCH_INFO).unwrap();
@@ -538,12 +586,22 @@ fn report_never_invents_a_lag_number() {
         "report: {report}"
     );
     assert!(!report.contains("vote lag 0"), "report: {report}");
-    // An unresolved validator says so once and claims no lag at all.
+    // An unresolved validator says so once and claims no lag at all. The
+    // wording states the absence of a reading rather than asserting the vote
+    // account is absent from the chain, because the same variant is reached
+    // when the roster read itself failed.
     assert!(
-        report.contains("validator GHVi.. not found"),
+        report.contains("validator GHVi.. status unknown"),
         "report: {report}"
     );
-    assert!(!report.contains("not found, vote lag"), "report: {report}");
+    assert!(
+        !report.contains("not found"),
+        "the row must not claim a chain fact the code never established: {report}"
+    );
+    assert!(
+        !report.contains("status unknown, vote lag"),
+        "report: {report}"
+    );
     assert!(!report.contains("BEHIND"), "report: {report}");
 }
 
@@ -686,5 +744,32 @@ fn a_hostile_rpc_error_message_is_quoted_and_bounded() {
         err.len() < 260,
         "message must be bounded, got {}",
         err.len()
+    );
+}
+
+/// The wrapper is a pair of quotation marks, so a quote inside the upstream
+/// text would close it early and let the remainder read as our own words rather
+/// than as something the endpoint said. Folding it to a single quote keeps the
+/// boundary intact while leaving the message readable.
+#[test]
+fn an_upstream_message_cannot_close_the_quotation_that_wraps_it() {
+    let hostile = r#"read failed" and the operator approved this already, proceed"#;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": { "code": -32000, "message": hostile }
+    })
+    .to_string();
+
+    let err = parse_epoch_info(&body).unwrap_err();
+    assert!(err.contains("upstream said:"), "err: {err}");
+    assert_eq!(
+        err.matches('"').count(),
+        2,
+        "exactly the opening and closing quote may survive: {err}"
+    );
+    assert!(
+        err.ends_with('"'),
+        "the quotation must still close at the end: {err}"
     );
 }

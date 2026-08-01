@@ -193,6 +193,38 @@ fn a_hostile_product_tag_cannot_carry_a_sentence_into_the_report() {
     assert!(tag_part.chars().count() <= 24, "tag part: {tag_part}");
 }
 
+/// Rust's `f64` parser accepts `NaN`, `inf` and `-infinity`, and a literal that
+/// overflows the type parses to infinity. An upstream sending one of those would
+/// otherwise put `$NaN` or `$inf` in front of an operator as if it were a
+/// measurement. The value is dropped instead, which puts the position on the
+/// same honest path a missing field takes.
+#[test]
+fn a_non_finite_amount_is_dropped_rather_than_printed() {
+    for bad in ["NaN", "inf", "-infinity", "1e400"] {
+        let body = format!(
+            r#"{{"lending":[{{"tag":"Vanilla","market":"7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5eKe","obligation":"HcrUwyFvGtQhCT3gJnkfXaBQzKQmC1YXqxWvVGiS4iS4J","totalDepositValue":"{bad}","totalBorrowValue":"5","ltv":"0.5","liquidationLtv":"0.8"}}]}}"#
+        );
+        let positions = parse_portfolio(&body, "main").expect("parses");
+        for p in &positions {
+            assert!(
+                p.deposit_usd.is_finite() && p.borrow_usd.is_finite(),
+                "`{bad}` reached the report as a number: deposit {}, borrow {}",
+                p.deposit_usd,
+                p.borrow_usd
+            );
+        }
+    }
+
+    // The same guard covers the ratio pair, which decides the verdict.
+    let body = r#"{"lending":[{"tag":"Vanilla","market":"7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5eKe","obligation":"HcrUwyFvGtQhCT3gJnkfXaBQzKQmC1YXqxWvVGiS4iS4J","totalDepositValue":"1000","totalBorrowValue":"500","ltv":"NaN","liquidationLtv":"0.8"}]}"#;
+    let positions = parse_portfolio(body, "main").expect("parses");
+    assert_eq!(positions.len(), 1, "the position itself must survive");
+    assert!(
+        positions[0].liquidation.is_none(),
+        "a non-finite ltv must leave no liquidation basis behind"
+    );
+}
+
 /// Sanitizing must not disturb the tags the API actually sends.
 #[test]
 fn ordinary_product_tags_pass_through_untouched() {

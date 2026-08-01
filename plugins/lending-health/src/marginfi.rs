@@ -72,9 +72,13 @@ const MAX_UPSTREAM_MSG: usize = 160;
 /// structure, and capping the length leaves the diagnostic value intact while
 /// denying the foothold.
 fn quote_upstream(msg: &str) -> String {
+    // The double quote is folded to a single one: the text is wrapped in
+    // quotation marks, and a quote inside it would close that wrapper early and
+    // let the rest of an upstream-chosen sentence read as our own words.
     let cleaned: String = msg
         .chars()
         .filter(|c| !c.is_control())
+        .map(|c| if c == '"' { '\'' } else { c })
         .take(MAX_UPSTREAM_MSG)
         .collect();
     let trimmed = cleaned.trim();

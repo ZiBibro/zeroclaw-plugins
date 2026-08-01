@@ -492,9 +492,13 @@ const MAX_UPSTREAM_MSG: usize = 160;
 /// structure, and capping the length leaves the diagnostic value intact while
 /// denying the foothold.
 fn quote_upstream(msg: &str) -> String {
+    // The double quote is folded to a single one: the text is wrapped in
+    // quotation marks, and a quote inside it would close that wrapper early and
+    // let the rest of an upstream-chosen sentence read as our own words.
     let cleaned: String = msg
         .chars()
         .filter(|c| !c.is_control())
+        .map(|c| if c == '\"' { '\'' } else { c })
         .take(MAX_UPSTREAM_MSG)
         .collect();
     let trimmed = cleaned.trim();
@@ -557,7 +561,8 @@ fn le_u32(bytes: &[u8]) -> u32 {
 }
 
 /// Extracts the durable blockhash from a nonce account read with
-/// `getAccountInfo` (encoding base64).
+/// `getAccountInfo` (encoding base64), and checks the account against the
+/// authority the operator configured.
 ///
 /// Both tags are checked before the nonce field is trusted. An account that was
 /// allocated and assigned to the System program but never initialized carries
@@ -565,7 +570,14 @@ fn le_u32(bytes: &[u8]) -> u32 {
 /// transaction that no validator will ever accept, and the failure surfaces only
 /// after a human has signed. A legacy-version account is refused for the same
 /// reason the runtime refuses it.
-pub fn parse_nonce_blockhash(body: &str) -> Result<[u8; 32], String> {
+///
+/// The authority at 8..40 is compared with `expected_authority` because
+/// `AdvanceNonceAccount` is authorized by the key the chain records, while the
+/// instruction this builder emits names the key the config carries. When those
+/// two disagree the transaction cannot land, so building it would spend an
+/// operator's approval on bytes that were dead before they were signed.
+pub fn parse_nonce_blockhash(body: &str, expected_authority: &str) -> Result<[u8; 32], String> {
+    let expected = decode_pubkey(expected_authority)?;
     let r = rpc_result(body)?;
     let value = r
         .get("value")
@@ -602,6 +614,12 @@ pub fn parse_nonce_blockhash(body: &str) -> Result<[u8; 32], String> {
     if state != NONCE_STATE_INITIALIZED {
         return Err(format!(
             "nonce account is not initialized (state tag {state}): run InitializeNonceAccount before using it as a durable nonce"
+        ));
+    }
+    if bytes[8..40] != expected {
+        return Err(format!(
+            "nonce account is controlled by `{}`, but config key `nonce_authority` says `{expected_authority}`; AdvanceNonceAccount would be signed by the wrong key and the transaction could not land",
+            bs58::encode(&bytes[8..40]).into_string()
         ));
     }
     let mut hash = [0u8; 32];
@@ -1014,20 +1032,39 @@ pub fn build_transaction(
     // visible head and tail, so an operator checking only the ends approves the
     // wrong account. Observed live on 2026-07-28, where the model truncated both
     // addresses in its own retelling.
+    // `compile_message` counts the signers from the account metas, so a nonce
+    // authority held on a different key makes this a two-signature transaction.
+    // Calling the fee payer the sole signer there would tell the operator the
+    // approval ends with them, while the bytes still wait on a key they may not
+    // hold. The count comes from the message that was actually serialized.
+    let signer_phrase = if message.num_required_signatures <= 1 {
+        format!("fee payer and sole signer {}", cfg.authority)
+    } else {
+        format!(
+            "fee payer {} (this transaction carries {} required signatures)",
+            cfg.authority, message.num_required_signatures
+        )
+    };
     let mut summary = format!(
-        "Unsigned {} transaction. Verify each address below in full before signing, and do not abbreviate them when relaying: a shortened address can be ground to match on its visible ends. Stake account {} (config label `{}`), fee payer and sole signer {}",
+        "Unsigned {} transaction. Verify each address below in full before signing, and do not abbreviate them when relaying: a shortened address can be ground to match on its visible ends. Stake account {} (config label `{}`), {}",
         action.as_str(),
         stake.pubkey,
         stake.label,
-        cfg.authority,
+        signer_phrase,
     );
     if let Some(v) = &voter {
         summary.push_str(&format!(", vote account {v}"));
     }
     if let Some(nonce) = &cfg.nonce {
         summary.push_str(&format!(
-            ", nonce account {} (authority {})",
-            nonce.account, nonce.authority
+            ", nonce account {} (authority {}{})",
+            nonce.account,
+            nonce.authority,
+            if nonce.authority == cfg.authority {
+                ""
+            } else {
+                ", a separate key that must sign this transaction too"
+            }
         ));
     }
     summary.push_str(if cfg.nonce.is_some() {
