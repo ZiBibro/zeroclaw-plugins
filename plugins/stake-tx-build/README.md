@@ -150,8 +150,8 @@ defenses do not depend on the agent behaving.
   so rather than reading as a clean bill of health.
 
   This warns and does not refuse, which is a deliberate difference from the
-  official Solana CLI. The CLI rejects the delegation outright
-  (`Unable to delegate. Vote account appears delinquent`) with no override flag.
+  official Solana CLI. The CLI rejects the delegation
+  (`Unable to delegate. Vote account appears delinquent`).
   An operator may be delegating to a validator they know is coming back, and a
   hard refusal here would strand them with no way through short of editing
   config. The enforcement boundary stays where the operator put it, in the

@@ -1231,7 +1231,7 @@ pub fn build_transaction(
         // skip the sentence that matters.
         match standing {
             Some(VoterStanding::Delinquent) => summary.push_str(
-                " (WARNING: this vote account is currently listed as DELINQUENT, meaning it has stopped voting; stake delegated to it earns nothing until it recovers, and the official Solana CLI refuses this delegation outright)",
+                " (WARNING: this vote account is currently listed as DELINQUENT, meaning it has stopped voting; stake delegated to it earns nothing until it recovers, and the official Solana CLI rejects this delegation)",
             ),
             Some(VoterStanding::Absent) => summary.push_str(
                 " (WARNING: this vote account appears in neither the current nor the delinquent validator list, so the chain does not know it as a voting validator at all)",
