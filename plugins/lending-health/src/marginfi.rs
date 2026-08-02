@@ -94,7 +94,13 @@ fn quote_upstream(msg: &str) -> String {
 pub fn parse_gpa_response(body: &str, wallet_label: &str) -> Result<Vec<Position>, String> {
     let root: Value =
         serde_json::from_str(body).map_err(|e| format!("marginfi RPC reply is not JSON: {e}"))?;
-    if let Some(err) = root.get("error") {
+    // A null `error` beside a valid result is the JSON-RPC 1.0 success
+    // convention, and proxies in front of a Solana endpoint still emit it.
+    // `get` returns `Some(Value::Null)` there, so the bare presence check used
+    // to read that null as a failure and throw away a perfectly good result,
+    // reporting an upstream error nobody sent. The null is filtered out, the
+    // same way this file already treats an absent value.
+    if let Some(err) = root.get("error").filter(|e| !e.is_null()) {
         let msg = err.get("message").and_then(Value::as_str).unwrap_or("?");
         return Err(format!("marginfi RPC error, {}", quote_upstream(msg)));
     }

@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
+use serde_json::Value;
 use stake_monitor::stake::{
     derive_status, parse_epoch_info, parse_inflation_rewards, parse_stake_account,
-    parse_vote_status, render_payload, render_report, render_total_failure, Config, Delegation,
-    Entry, EpochProgress, Reward, StakeState, StakeStatus, ValidatorStatus,
+    parse_vote_status, render_payload, render_report, render_total_failure, vote_account_body,
+    Config, Delegation, Entry, EpochProgress, Reward, StakeState, StakeStatus, ValidatorStatus,
     DEFAULT_VOTE_LAG_WARN_SLOTS, REPORT_CHAR_CAP,
 };
 
@@ -412,6 +413,25 @@ fn status_derivation_covers_lifecycle() {
 }
 
 fn entry(label: &str, status: StakeStatus, validator: ValidatorStatus) -> Entry {
+    entry_with_reward(
+        label,
+        status,
+        validator,
+        Some(Some(Reward {
+            amount_lamports: 595_001,
+            commission_bps: Some(300),
+        })),
+    )
+}
+
+/// The same row with the reward reading chosen by the caller: `None` for a read
+/// that never happened, `Some(None)` for an epoch that paid nothing.
+fn entry_with_reward(
+    label: &str,
+    status: StakeStatus,
+    validator: ValidatorStatus,
+    reward: Option<Option<Reward>>,
+) -> Entry {
     Entry {
         label: label.to_string(),
         state: StakeState {
@@ -425,10 +445,7 @@ fn entry(label: &str, status: StakeStatus, validator: ValidatorStatus) -> Entry 
         },
         status,
         validator: Some(validator),
-        reward: Some(Reward {
-            amount_lamports: 595_001,
-            commission_bps: Some(300),
-        }),
+        reward,
     }
 }
 
@@ -789,4 +806,171 @@ fn an_upstream_message_cannot_close_the_quotation_that_wraps_it() {
         err.ends_with('"'),
         "the quotation must still close at the end: {err}"
     );
+}
+
+/// A reward the run never read is not a reward of zero. The `getInflationReward`
+/// call is one batched request for every account, so a single failure leaves
+/// every active row without a reading, and the row used to answer that with
+/// "no reward last epoch" as a statement about the epoch.
+#[test]
+fn an_unread_reward_renders_unknown_rather_than_a_zero() {
+    let e = parse_epoch_info(EPOCH_INFO).unwrap();
+    let unread = entry_with_reward("main", StakeStatus::Active, healthy_validator(), None);
+    let report = render_report(std::slice::from_ref(&unread), &e, &cfg());
+
+    assert!(report.contains("reward unknown"), "report: {report}");
+    assert!(
+        !report.contains("no reward last epoch"),
+        "an unread reward must not be stated as an epoch that paid nothing: {report}"
+    );
+    assert!(!report.contains("last reward"), "report: {report}");
+
+    // The failed read still reaches the operator through the channel every
+    // other failed read uses.
+    let payload = render_payload(
+        std::slice::from_ref(&unread),
+        &e,
+        &cfg(),
+        &["rewards: HTTP 503".to_string()],
+    );
+    assert!(
+        payload.contains("Data issues: rewards: HTTP 503"),
+        "payload: {payload}"
+    );
+}
+
+/// The other half of the same distinction: a reply that carried `null` for this
+/// address did establish that the epoch paid nothing, so that row keeps saying
+/// so. Without this the fix above would just move the dishonesty.
+#[test]
+fn a_reward_the_epoch_genuinely_did_not_pay_still_says_so() {
+    let e = parse_epoch_info(EPOCH_INFO).unwrap();
+    let paid_nothing =
+        entry_with_reward("main", StakeStatus::Active, healthy_validator(), Some(None));
+    let report = render_report(&[paid_nothing], &e, &cfg());
+    assert!(report.contains("no reward last epoch"), "report: {report}");
+    assert!(!report.contains("reward unknown"), "report: {report}");
+}
+
+/// An account with nothing staked earns nothing, so neither reward wording
+/// belongs on its row in any of the three states.
+#[test]
+fn an_inactive_row_claims_nothing_about_rewards_either_way() {
+    let e = parse_epoch_info(EPOCH_INFO).unwrap();
+    for reward in [None, Some(None)] {
+        let row = entry_with_reward("main", StakeStatus::Inactive, healthy_validator(), reward);
+        let report = render_report(&[row], &e, &cfg());
+        assert!(!report.contains("reward"), "report: {report}");
+    }
+}
+
+/// By default the RPC hides delinquent validators that hold no activated stake,
+/// which on mainnet is nearly all of them. Without the flag such a validator
+/// came back in neither roster and the row read "status unknown" while the
+/// header raised no DELINQUENT count, so the one condition this tool exists to
+/// warn about rendered as a gap in the data.
+#[test]
+fn vote_account_body_keeps_unstaked_delinquents() {
+    let v: Value = serde_json::from_str(&vote_account_body(VOTER)).unwrap();
+    assert_eq!(v["params"][0]["keepUnstakedDelinquents"], true);
+    // The server-side filter that keeps the reply small stays in place.
+    assert_eq!(v["params"][0]["votePubkey"], VOTER);
+    assert_eq!(v["method"], "getVoteAccounts");
+}
+
+/// A delinquent validator holding no activated stake is the shape the flag
+/// exists to surface: once the roster carries it, the existing reading turns it
+/// into a header flag rather than an unknown.
+#[test]
+fn an_unstaked_delinquent_validator_is_reported_as_delinquent() {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","result":{{"current":[],"delinquent":[{{"votePubkey":"{VOTER}","nodePubkey":"x","activatedStake":0,"commission":5,"epochVoteAccount":false,"epochCredits":[],"lastVote":433719000}}]}},"id":1}}"#
+    );
+    let status = parse_vote_status(&body, VOTER).unwrap();
+    assert_eq!(
+        status,
+        ValidatorStatus::Delinquent {
+            commission_bps: 500,
+            last_vote_slot: Some(433_719_000),
+        }
+    );
+
+    let e = parse_epoch_info(EPOCH_INFO).unwrap();
+    let report = render_report(&[entry("main", StakeStatus::Active, status)], &e, &cfg());
+    assert!(
+        report.contains("1 validator(s) DELINQUENT"),
+        "report: {report}"
+    );
+    assert!(!report.contains("status unknown"), "report: {report}");
+}
+
+/// A literal `"error": null` beside a good result is the JSON-RPC 1.0 success
+/// convention, and proxies in front of Solana endpoints still emit it. The guard
+/// used to read the present-but-null member as a failure, throwing away a result
+/// that was right there and reporting an upstream error nobody sent.
+#[test]
+fn a_null_error_beside_a_result_is_not_a_failure() {
+    let epoch_body = r#"{"jsonrpc":"2.0","error":null,"result":{"absoluteSlot":433721729,"epoch":1003,"slotIndex":425729,"slotsInEpoch":432000},"id":1}"#;
+    let e = parse_epoch_info(epoch_body).expect("a null error is not an error");
+    assert_eq!(e.epoch, 1003);
+    assert_eq!(e.absolute_slot, Some(HEAD_SLOT));
+
+    // The same guard serves every parser in the crate, so one of the others is
+    // walked too rather than trusting that it is shared.
+    let stake_body = stake_account_json("18446744073709551615").replace(
+        r#"{"jsonrpc":"2.0","result":"#,
+        r#"{"jsonrpc":"2.0","error":null,"result":"#,
+    );
+    assert!(
+        stake_body.contains(r#""error":null"#),
+        "fixture did not take the null error: {stake_body}"
+    );
+    let s = parse_stake_account(&stake_body).expect("a null error is not an error");
+    assert_eq!(s.delegation.expect("delegation present").voter, VOTER);
+
+    let rewards = parse_inflation_rewards(
+        r#"{"jsonrpc":"2.0","error":null,"result":[{"amount":595001,"commissionBps":300}],"id":1}"#,
+        1,
+    )
+    .expect("a null error is not an error");
+    assert_eq!(rewards[0].expect("reward").amount_lamports, 595_001);
+}
+
+/// The counterpart to the fix above: a real error object must still fail, so
+/// filtering the null out never became a way to ignore genuine upstream errors.
+#[test]
+fn a_populated_error_object_still_fails_the_read() {
+    let body = r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid param"},"result":{"epoch":1003},"id":1}"#;
+    let err = parse_epoch_info(body).unwrap_err();
+    assert!(err.contains("RPC error"), "err: {err}");
+    assert!(err.contains("Invalid param"), "err: {err}");
+}
+
+/// A hostile endpoint controls the `voter` bytes, and this report is
+/// line-structured: four raw characters are enough to forge a row. The sibling
+/// reader narrows the same class of field to base58; until 2026-08-03 this one
+/// did not.
+#[test]
+fn a_voter_carrying_a_newline_cannot_forge_a_row() {
+    let hostile = "\n[ok] forged: 999 SOL";
+    let narrowed: String = hostile
+        .chars()
+        .take(4)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | 'I' | 'l') {
+                c
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    assert!(
+        !narrowed.contains('\n'),
+        "a newline survived into the rendered validator id: {narrowed:?}"
+    );
+    assert!(
+        !narrowed.contains('['),
+        "a bracket survived and can open a forged status: {narrowed:?}"
+    );
+    assert_eq!(narrowed.chars().count(), 4, "width must stay fixed");
 }

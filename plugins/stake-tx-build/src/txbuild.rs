@@ -680,7 +680,12 @@ fn quote_upstream(msg: &str) -> String {
 fn rpc_result(body: &str) -> Result<Value, String> {
     let root: Value =
         serde_json::from_str(body).map_err(|e| format!("RPC reply is not JSON: {e}"))?;
-    if let Some(err) = root.get("error") {
+    // A null `error` beside a valid result is the JSON-RPC 1.0 success
+    // convention, and proxies in front of Solana endpoints still emit it.
+    // `get` answers `Some(Null)` there, so an unfiltered guard read that
+    // success as a failure and threw away the result it was carrying, turning
+    // a good reply into "RPC error, upstream sent an empty message".
+    if let Some(err) = root.get("error").filter(|e| !e.is_null()) {
         let msg = err.get("message").and_then(Value::as_str).unwrap_or("?");
         return Err(format!("RPC error, {}", quote_upstream(msg)));
     }
@@ -696,8 +701,17 @@ fn rpc_result(body: &str) -> Result<Value, String> {
 pub fn parse_genesis_hash(body: &str) -> Result<String, String> {
     let r = rpc_result(body)?;
     let hash = r.as_str().ok_or("getGenesisHash reply has no hash")?.trim();
-    validate_pubkey(hash, "genesis hash")
-        .map_err(|_| format!("genesis hash `{hash}` is not 32 bytes of base58"))?;
+    // The rejected string is endpoint-chosen text on the one read that runs
+    // before every build, and it reaches the model through `fail` in lib.rs.
+    // It used to be interpolated raw, so an endpoint could push newlines and an
+    // unbounded body into the agent's context on this path while `error.message`
+    // right beside it was quoted, stripped and capped.
+    validate_pubkey(hash, "genesis hash").map_err(|_| {
+        format!(
+            "genesis hash is not 32 bytes of base58, {}",
+            quote_upstream(hash)
+        )
+    })?;
     Ok(hash.to_string())
 }
 
@@ -708,7 +722,15 @@ pub fn parse_latest_blockhash(body: &str) -> Result<[u8; 32], String> {
         .and_then(|v| v.get("blockhash"))
         .and_then(Value::as_str)
         .ok_or("getLatestBlockhash reply has no blockhash")?;
-    decode_pubkey(hash).map_err(|_| format!("blockhash `{hash}` is not 32 bytes of base58"))
+    // Same trust boundary as the genesis path: the `result` field is written by
+    // whoever runs the endpoint, so a malformed blockhash is quoted rather than
+    // echoed verbatim.
+    decode_pubkey(hash).map_err(|_| {
+        format!(
+            "blockhash is not 32 bytes of base58, {}",
+            quote_upstream(hash)
+        )
+    })
 }
 
 /// Layout of a nonce account, per `NonceAccountLayout` in solana-web3.js and
@@ -753,8 +775,17 @@ pub fn parse_nonce_blockhash(body: &str, expected_authority: &str) -> Result<[u8
         .ok_or("nonce account not found on chain")?;
     let owner = value.get("owner").and_then(Value::as_str).unwrap_or("");
     if owner != SYSTEM_PROGRAM_ID {
+        // A genuine reply always carries a base58 pubkey here, so naming the
+        // real program id keeps the diagnostic whole. Anything else is
+        // endpoint-chosen text that used to be interpolated raw and uncapped
+        // into an error the model reads, the same foothold `quote_upstream`
+        // already denies on the `error.message` route.
+        let shown = match validate_pubkey(owner, "owner") {
+            Ok(()) => format!("`{owner}`"),
+            Err(_) => "a value that is not a pubkey".to_string(),
+        };
         return Err(format!(
-            "nonce account is owned by `{owner}`; expected the System program"
+            "nonce account is owned by {shown}; expected the System program"
         ));
     }
     let b64 = value

@@ -1,8 +1,32 @@
-use lending_health::health::Protocol;
+use std::collections::HashMap;
+
+use lending_health::health::{render_report, Config, Protocol};
 use lending_health::kamino::{iso_to_epoch, parse_portfolio, portfolio_url};
 
 const ACTIVE: &str = include_str!("fixtures/kamino_portfolio_active.json");
 const EMPTY: &str = include_str!("fixtures/kamino_portfolio_empty.json");
+
+/// Allowlisted wallet for the render-level checks below. Kamino-only, so the
+/// config needs no RPC endpoint.
+const WALLET: &str = "86xCnPeV69n6t3DnyGvkKobf9FdN2H9oiVDdaMpo2MMY";
+
+fn kamino_only_config() -> Config {
+    let section: HashMap<String, String> = [
+        ("wallets".to_string(), format!("main:{WALLET}")),
+        ("protocols".to_string(), "kamino".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    Config::from_section(&section).expect("test config")
+}
+
+/// One lending row with caller-chosen JSON literals for the two amounts, so a
+/// test can make exactly one of them unreadable.
+fn one_row(deposit: &str, borrow: &str) -> String {
+    format!(
+        r#"{{"lending":[{{"tag":"Vanilla","market":"7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5eKe","obligation":"HcrUwyFvGtQhCT3gJnkfXaBQzKQmC1YXqxWvVGiS4iS4J","totalDepositValue":{deposit},"totalBorrowValue":{borrow},"ltv":"0.74","liquidationLtv":"0.75"}}]}}"#
+    )
+}
 
 #[test]
 fn url_is_built_from_base_and_wallet() {
@@ -205,6 +229,14 @@ fn a_non_finite_amount_is_dropped_rather_than_printed() {
             r#"{{"lending":[{{"tag":"Vanilla","market":"7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5eKe","obligation":"HcrUwyFvGtQhCT3gJnkfXaBQzKQmC1YXqxWvVGiS4iS4J","totalDepositValue":"{bad}","totalBorrowValue":"5","ltv":"0.5","liquidationLtv":"0.8"}}]}}"#
         );
         let positions = parse_portfolio(&body, "main").expect("parses");
+        // Asserted before the loop: the loop body was vacuous while the parser
+        // dropped the whole row, so this test passed on a report that stated
+        // the wallet held nothing.
+        assert_eq!(
+            positions.len(),
+            1,
+            "the position itself must survive `{bad}`"
+        );
         for p in &positions {
             assert!(
                 p.deposit_usd.is_finite() && p.borrow_usd.is_finite(),
@@ -248,4 +280,130 @@ fn a_tag_of_only_hostile_characters_falls_back_to_a_marker() {
     let positions = parse_portfolio(body, "main").expect("parses");
     // Dots remain: the field's length stays visible, nothing vanishes silently.
     assert_eq!(positions[0].market, "......@7u3H");
+}
+
+/// An unreadable amount costs that one figure, never the position. The parser
+/// used to take both amounts with `?`, so a single unparseable number dropped a
+/// row carrying a live obligation and the report stated the wallet held
+/// nothing. The surviving row substitutes a zero for the side it could not read
+/// and says so, which is a gap the operator can see rather than a false claim.
+#[test]
+fn a_row_with_one_unreadable_amount_keeps_the_position_and_labels_the_gap() {
+    let unreadable_deposit = one_row("null", "\"40470.67\"");
+    let positions = parse_portfolio(&unreadable_deposit, "main").expect("parses");
+    assert_eq!(
+        positions.len(),
+        1,
+        "the position must survive: {positions:?}"
+    );
+    assert_eq!(positions[0].deposit_usd, 0.0);
+    assert!((positions[0].borrow_usd - 40_470.67).abs() < 0.01);
+    assert_eq!(
+        positions[0].stale_hint.as_deref(),
+        Some("deposit value unreadable"),
+        "the substituted zero must be labelled, never asserted"
+    );
+    // The verdict survives with the row: the ratio pair is untouched.
+    let liq = positions[0].liquidation.expect("liquidation basis");
+    assert!((liq.ltv - 0.74).abs() < 1e-9);
+    assert!((liq.liquidation_ltv - 0.75).abs() < 1e-9);
+
+    let unreadable_borrow = one_row("\"53724.48\"", "\"NaN\"");
+    let positions = parse_portfolio(&unreadable_borrow, "main").expect("parses");
+    assert_eq!(
+        positions.len(),
+        1,
+        "the position must survive: {positions:?}"
+    );
+    assert!((positions[0].deposit_usd - 53_724.48).abs() < 0.01);
+    assert_eq!(positions[0].borrow_usd, 0.0);
+    assert_eq!(
+        positions[0].stale_hint.as_deref(),
+        Some("borrow value unreadable")
+    );
+}
+
+/// The defect in the terms an operator would meet it in: a wallet one point from
+/// its liquidation line, whose deposit figure the endpoint mangled, used to be
+/// reported as holding no positions at all.
+#[test]
+fn a_wallet_at_its_line_is_never_reported_as_holding_nothing() {
+    let cfg = kamino_only_config();
+    let positions =
+        parse_portfolio(&one_row("\"unparseable\"", "\"40470.67\""), "main").expect("parses");
+    let report = render_report(&positions, &cfg);
+    assert!(
+        !report.contains("No open lending positions"),
+        "report: {report}"
+    );
+    assert!(report.contains("[CRITICAL]"), "report: {report}");
+    assert!(report.contains("borrow $40471"), "report: {report}");
+    assert!(
+        report.contains("(deposit value unreadable)"),
+        "report: {report}"
+    );
+}
+
+/// The other half of the rule: a row with neither amount readable measures
+/// nothing at all, so it is not a position and must not appear as a $0 line.
+#[test]
+fn a_row_with_neither_amount_readable_is_not_a_position() {
+    let positions = parse_portfolio(&one_row("null", "\"NaN\""), "main").expect("parses");
+    assert!(positions.is_empty(), "positions: {positions:?}");
+}
+
+/// A staleness hint and an unreadable amount are separate facts about the same
+/// row, so both reach the line rather than one displacing the other.
+#[test]
+fn an_unreadable_amount_joins_the_staleness_hint_it_shares_a_row_with() {
+    let body = ACTIVE.replace(
+        "\"totalDepositValue\":\"200638.24361892240278\"",
+        "\"totalDepositValue\":null",
+    );
+    assert!(
+        body.contains("\"totalDepositValue\":null"),
+        "fixture shape changed, update this test"
+    );
+    let positions = parse_portfolio(&body, "main").expect("parses");
+    assert_eq!(positions.len(), 3, "no row may be lost: {positions:?}");
+    assert_eq!(
+        positions[0].stale_hint.as_deref(),
+        Some("positions stale 39 h; deposit value unreadable")
+    );
+}
+
+/// An HTTP 200 whose lending section carries its own errors and hands back no
+/// positions is a partial upstream failure. It used to render as a clean
+/// all-clear, which is indistinguishable from a healthy empty wallet and answers
+/// the question this tool exists to answer with a number nobody measured.
+#[test]
+fn a_section_error_with_no_positions_is_a_data_issue_not_an_all_clear() {
+    let body = EMPTY.replacen(
+        "\"errors\":[]",
+        "\"errors\":[\"reserve 47tf could not be priced\"]",
+        1,
+    );
+    assert!(
+        body.find("\"errors\":[\"").unwrap() < body.find("\"multiply\"").unwrap(),
+        "the replaced section must be the lending one; fixture shape changed"
+    );
+    let err = parse_portfolio(&body, "main").unwrap_err();
+    assert!(err.contains("section(s) reported errors"), "err: {err}");
+
+    // Unchanged, the same capture is a genuine all-clear.
+    assert!(parse_portfolio(EMPTY, "main").unwrap().is_empty());
+}
+
+/// The gate is on an empty result, so a section that reported errors never costs
+/// the positions the other sections did return: a gap is not a false zero in
+/// either direction.
+#[test]
+fn a_section_error_does_not_discard_positions_that_came_back() {
+    let body = ACTIVE.replacen(
+        "\"errors\":[]",
+        "\"errors\":[\"reserve 47tf could not be priced\"]",
+        1,
+    );
+    let positions = parse_portfolio(&body, "main").expect("positions still came back");
+    assert_eq!(positions.len(), 3);
 }

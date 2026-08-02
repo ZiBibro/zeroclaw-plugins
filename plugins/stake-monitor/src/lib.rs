@@ -142,6 +142,8 @@ mod component {
                     state,
                     status,
                     validator,
+                    // Unread until the batched reward call below answers for
+                    // this row; a run that never gets that far leaves it here.
                     reward: None,
                 });
             }
@@ -161,8 +163,12 @@ mod component {
                     .and_then(|b| stake::parse_inflation_rewards(&b, pubkeys.len()))
                 {
                     Ok(rewards) => {
+                        // The outer `Some` records that the read happened at
+                        // all; the inner option is the epoch's own answer. Rows
+                        // left at `None` above are the ones no reply covered,
+                        // and they render as unknown rather than as zero.
                         for (entry, reward) in entries.iter_mut().zip(rewards) {
-                            entry.reward = reward;
+                            entry.reward = Some(reward);
                         }
                     }
                     Err(e) => issues.push(format!("rewards: {e}")),

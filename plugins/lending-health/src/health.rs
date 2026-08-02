@@ -571,12 +571,20 @@ fn render_within(positions: &[Position], cfg: &Config, cap: usize) -> String {
         return "No open lending positions found for the configured wallets.".to_string();
     }
 
-    // Ordering key inside a risk bucket. A condemned account with no basis is
-    // known to sit at its liquidation line, so it orders at the line instead
-    // of at the bottom of the bucket. The key stays internal to the sort; no
-    // rendered line ever carries it.
+    // Ordering key inside a risk bucket: how much of the buffer is already
+    // spent, i.e. the current LTV as a share of the line that position is
+    // measured against. The key used to be the raw LTV, which ordered a
+    // MarginFi account at 97% of a 100% line above a Kamino one already past a
+    // 65% line, so the position nearest seizure was not the one printed first.
+    // Written as `1 - buffer` to keep the sort on the same published basis as
+    // [`classify_position`], so the ordering and the buckets cannot drift
+    // apart. A basis that measures nothing orders at the bottom of the bucket,
+    // as before. A condemned account with no basis is known to sit at its
+    // liquidation line, so it orders at the line, which on this key is still
+    // exactly 1.0. The key stays internal to the sort; no rendered line ever
+    // carries it.
     let ltv_of = |p: &Position| match p.liquidation {
-        Some(l) => l.ltv,
+        Some(l) => liquidation_buffer(l).map_or(0.0, |buffer| 1.0 - buffer),
         None if p.flagged_unhealthy => 1.0,
         None => 0.0,
     };

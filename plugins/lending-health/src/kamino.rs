@@ -22,14 +22,19 @@ pub fn portfolio_url(api_base: &str, wallet_pubkey: &str) -> String {
 }
 
 /// Parses a `GET /portfolio/{wallet}` body into normalized positions.
-/// A wallet with no positions yields an empty vector, not an error.
+/// A wallet with no positions yields an empty vector, not an error. A body whose
+/// obligation sections reported their own errors and returned nothing is an
+/// error instead, because an empty read and an empty wallet are otherwise
+/// indistinguishable in the report.
 pub fn parse_portfolio(body: &str, wallet_label: &str) -> Result<Vec<Position>, String> {
     let root: Value =
         serde_json::from_str(body).map_err(|e| format!("kamino portfolio is not JSON: {e}"))?;
 
     let mut out = Vec::new();
+    let mut section_errors = 0usize;
     for product in OBLIGATION_PRODUCTS {
         let stale_hint = staleness_hint(&root, product);
+        section_errors += section_error_count(&root, product);
         let Some(rows) = root.get(product).and_then(Value::as_array) else {
             continue;
         };
@@ -39,7 +44,28 @@ pub fn parse_portfolio(body: &str, wallet_label: &str) -> Result<Vec<Position>, 
             }
         }
     }
+    // A section that reported its own errors and handed back nothing is a gap in
+    // the read, not a wallet with no debt. This used to render as a clean "no
+    // open lending positions found", which answers the one question this tool
+    // exists to answer with a number nobody measured. The gate is on
+    // `out.is_empty()` so a section error never costs positions that did come
+    // back: a gap is not a false zero in either direction.
+    if out.is_empty() && section_errors > 0 {
+        return Err(format!(
+            "{section_errors} product section(s) reported errors and no positions came back"
+        ));
+    }
     Ok(out)
+}
+
+/// Entries in `sections.{product}.errors`: the endpoint's own account of what it
+/// could not read for that product. Empty in both live captures.
+fn section_error_count(root: &Value, product: &str) -> usize {
+    root.get("sections")
+        .and_then(|s| s.get(product))
+        .and_then(|s| s.get("errors"))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
 }
 
 fn parse_row(
@@ -48,11 +74,34 @@ fn parse_row(
     wallet_label: &str,
     stale_hint: Option<String>,
 ) -> Option<Position> {
-    let deposit_usd = str_num(row, "totalDepositValue")?;
-    let borrow_usd = str_num(row, "totalBorrowValue")?;
+    // An unreadable amount costs that one figure, never the position. The `?` on
+    // each read used to drop the whole row, so a wallet sitting at its
+    // liquidation line with one unparseable amount was reported as holding
+    // nothing at all: a false claim about the chain rather than a gap in it. The
+    // substituted 0 is labelled through the same hint channel the rendered line
+    // already carries, so it reads as a value nobody could measure rather than
+    // as a measurement. A row carrying neither amount is not a position.
+    let deposit = str_num(row, "totalDepositValue");
+    let borrow = str_num(row, "totalBorrowValue");
+    if deposit.is_none() && borrow.is_none() {
+        return None;
+    }
+    let deposit_usd = deposit.unwrap_or(0.0);
+    let borrow_usd = borrow.unwrap_or(0.0);
     if deposit_usd == 0.0 && borrow_usd == 0.0 {
         return None;
     }
+    let unreadable = match (deposit, borrow) {
+        (None, _) => Some("deposit value unreadable"),
+        (_, None) => Some("borrow value unreadable"),
+        _ => None,
+    };
+    let stale_hint = match (stale_hint, unreadable) {
+        (Some(s), Some(u)) => Some(format!("{s}; {u}")),
+        (Some(s), None) => Some(s),
+        (None, Some(u)) => Some(u.to_string()),
+        (None, None) => None,
+    };
     // A missing or unreadable ratio pair costs the liquidation distance for this
     // position, never the position itself. The deposit and borrow figures above
     // are already known, and dropping the row would make the report state the

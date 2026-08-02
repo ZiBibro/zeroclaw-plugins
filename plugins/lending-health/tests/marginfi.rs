@@ -164,6 +164,35 @@ fn empty_result_yields_no_positions() {
     assert!(positions.is_empty());
 }
 
+/// A null `error` beside a valid result is the JSON-RPC 1.0 success convention,
+/// and proxies in front of a Solana endpoint still emit it. The guard used to
+/// test only for the presence of the key, so it read that null as a failure,
+/// threw away a perfectly good account and reported an upstream error nobody
+/// sent.
+#[test]
+fn a_null_error_beside_a_result_is_not_a_failure() {
+    let body = GPA_RESPONSE.replacen(
+        "{\"jsonrpc\":\"2.0\",",
+        "{\"jsonrpc\":\"2.0\",\"error\":null,",
+        1,
+    );
+    assert!(
+        body.contains("\"error\":null"),
+        "fixture shape changed, update this test"
+    );
+    let positions = parse_gpa_response(&body, "main").expect("a null error is no error");
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].account, "EN1W..K7ND");
+
+    // The same reading on an empty result, where nothing else could have failed.
+    let bare = r#"{"jsonrpc":"2.0","error":null,"result":[],"id":1}"#;
+    assert!(parse_gpa_response(bare, "main").unwrap().is_empty());
+
+    // A real error object is still an error.
+    let real = r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"invalid params"},"result":[],"id":1}"#;
+    assert!(parse_gpa_response(real, "main").is_err());
+}
+
 #[test]
 fn zeroed_account_is_skipped() {
     let zeroed = vec![0u8; 2312];

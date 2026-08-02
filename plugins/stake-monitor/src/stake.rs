@@ -257,10 +257,20 @@ pub fn stake_account_body(pubkey: &str) -> String {
 
 /// One vote account, filtered server-side so the response stays tiny instead
 /// of the full 700-validator roster.
+///
+/// `keepUnstakedDelinquents` is not optional here, despite the name suggesting
+/// a nicety. By default the RPC omits delinquent validators that hold no active
+/// stake, and on mainnet that is the overwhelming majority of them: a census
+/// during review found 6136 of 6148 delinquents hidden behind the default. A
+/// validator that stopped voting long enough to lose its stake is exactly the
+/// one an operator needs told about, and without this flag it came back in
+/// neither roster, mapped to [`ValidatorStatus::Unknown`], and rendered as
+/// `status unknown` while the report raised no DELINQUENT flag at all. The
+/// sibling plugin `stake-tx-build` passes the flag for the same reason.
 pub fn vote_account_body(vote_pubkey: &str) -> String {
     serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "getVoteAccounts",
-        "params": [{ "votePubkey": vote_pubkey }]
+        "params": [{ "votePubkey": vote_pubkey, "keepUnstakedDelinquents": true }]
     })
     .to_string()
 }
@@ -309,7 +319,12 @@ fn quote_upstream(msg: &str) -> String {
 fn rpc_result(body: &str) -> Result<Value, String> {
     let root: Value =
         serde_json::from_str(body).map_err(|e| format!("RPC reply is not JSON: {e}"))?;
-    if let Some(err) = root.get("error") {
+    // A literal `"error": null` beside a good result is the JSON-RPC 1.0 success
+    // convention, and proxies in front of Solana endpoints still emit it.
+    // `get` answers `Some(Null)` there, so the unfiltered guard used to throw the
+    // result away and report an upstream failure that never happened. The same
+    // null filter already guards the `value` key below.
+    if let Some(err) = root.get("error").filter(|e| !e.is_null()) {
         let msg = err.get("message").and_then(Value::as_str).unwrap_or("?");
         return Err(format!("RPC error, {}", quote_upstream(msg)));
     }
@@ -640,7 +655,14 @@ pub struct Entry {
     pub state: StakeState,
     pub status: StakeStatus,
     pub validator: Option<ValidatorStatus>,
-    pub reward: Option<Reward>,
+    /// Three states, the same honesty the validator reading already carries.
+    /// `None` means the reward was never read: the `getInflationReward` call
+    /// failed, or the run was too early in chain history to have a previous
+    /// epoch to ask about. `Some(None)` means the reply carried `null` for this
+    /// address, which is the epoch having genuinely paid nothing. Collapsing
+    /// the two used to print "no reward last epoch" as a fact on every active
+    /// row whenever the reward read failed.
+    pub reward: Option<Option<Reward>>,
 }
 
 fn fmt_sol(lamports: u64) -> String {
@@ -833,7 +855,25 @@ fn render_within(entries: &[Entry], epoch: &EpochInfo, cfg: &Config, budget: usi
             )
         )];
         if let Some(d) = &e.state.delegation {
-            let voter_short: String = d.voter.chars().take(4).collect();
+            // The voter comes off the RPC reply, so whoever answers `rpc_url`
+            // controls these bytes. Four characters cannot carry an
+            // instruction, and they can carry a newline: this report is
+            // line-structured, so one smuggled break forges a row. Narrowing to
+            // the base58 alphabet is the same guard `short_pubkey` applies in
+            // lending-health; until 2026-08-03 this site took the four
+            // characters raw.
+            let voter_short: String = d
+                .voter
+                .chars()
+                .take(4)
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | 'I' | 'l') {
+                        c
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
             let vstat = match &e.validator {
                 Some(v @ ValidatorStatus::Ok { commission_bps, .. }) => {
                     format!(
@@ -862,11 +902,21 @@ fn render_within(entries: &[Entry], epoch: &EpochInfo, cfg: &Config, budget: usi
             };
             parts.push(vstat);
         }
+        // A reward that was never read is not a reward of zero. The failed-read
+        // case used to fall into the same arm as an explicit null and print
+        // "no reward last epoch" on every active row, stating as a fact about
+        // the epoch something the run never established. The reason for the
+        // failure rides the data-issues line, as with every other failed read.
         match &e.reward {
-            Some(r) => parts.push(format!("last reward {} SOL", fmt_sol(r.amount_lamports))),
-            None => {
+            Some(Some(r)) => parts.push(format!("last reward {} SOL", fmt_sol(r.amount_lamports))),
+            Some(None) => {
                 if e.status == StakeStatus::Active {
                     parts.push("no reward last epoch".to_string());
+                }
+            }
+            None => {
+                if e.status == StakeStatus::Active {
+                    parts.push("reward unknown".to_string());
                 }
             }
         }

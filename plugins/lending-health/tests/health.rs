@@ -319,7 +319,11 @@ fn condemned_position_leads_the_report_and_survives_the_cap() {
 fn condemned_position_outranks_a_measured_critical_below_the_line() {
     let cfg = Config::from_section(&base_section()).unwrap();
     let positions = vec![
-        position("main", "burning", 0.90),
+        // Critical but still short of the helper's 0.85 line: 3.5% of the
+        // buffer left. The fixture used to say 0.90, which is 5.9% PAST that
+        // line despite the name of this test, because it was written on the
+        // raw-LTV mental model in which 1.0 is the line for everyone.
+        position("main", "burning", 0.82),
         condemned("main", "condemned"),
         position("main", "past-the-line", 1.20),
     ];
@@ -616,4 +620,63 @@ fn a_condemned_account_stays_critical_even_with_no_debt() {
         stale_hint: None,
     };
     assert_eq!(classify_position(&condemned, &cfg), Risk::Critical);
+}
+
+/// Inside a risk bucket the report is read top down, so the row printed first
+/// must be the one nearest seizure. Ordering used to be on the raw LTV, which
+/// compares two numbers measured against different lines: a MarginFi account at
+/// 97% of a 100% line outranked a Kamino obligation already inside 1.5% of a
+/// 65% line, so the position an operator had to act on first was printed
+/// second.
+#[test]
+fn inside_a_bucket_the_position_nearest_its_own_line_is_printed_first() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let mut wide_line = position("main", "wide-line", 0.97);
+    wide_line.protocol = Protocol::Marginfi;
+    wide_line.liquidation = Some(Liquidation {
+        ltv: 0.97,
+        liquidation_ltv: 1.00,
+    });
+    let mut tight_line = position("main", "tight-line", 0.64);
+    tight_line.liquidation = Some(Liquidation {
+        ltv: 0.64,
+        liquidation_ltv: 0.65,
+    });
+
+    // Both sit in the same bucket, so the bucket order decides nothing here.
+    assert_eq!(classify_position(&wide_line, &cfg), Risk::Critical);
+    assert_eq!(classify_position(&tight_line, &cfg), Risk::Critical);
+    // 1.5% of the buffer left against 3.0%: the tighter one is nearer seizure.
+    assert!(
+        liquidation_buffer(tight_line.liquidation.unwrap()).unwrap()
+            < liquidation_buffer(wide_line.liquidation.unwrap()).unwrap()
+    );
+
+    let report = render_report(&[wide_line, tight_line], &cfg);
+    assert!(
+        report.find("tight-line").unwrap() < report.find("wide-line").unwrap(),
+        "report: {report}"
+    );
+}
+
+/// The sort key is a share of each position's own line, so a basis that
+/// measures nothing keeps its old place at the bottom of the bucket rather than
+/// being ranked on a number no arithmetic produced.
+#[test]
+fn an_unmeasurable_basis_stays_at_the_bottom_of_its_bucket() {
+    let cfg = Config::from_section(&base_section()).unwrap();
+    let mut no_line = position("main", "no-line", 0.0);
+    no_line.liquidation = Some(Liquidation {
+        ltv: f64::NAN,
+        liquidation_ltv: 0.0,
+    });
+    let mut measured = position("main", "measured", 0.0);
+    measured.liquidation = None;
+    let positions = vec![no_line, measured];
+    // Both land in Unknown, where the measurable one is the one with a figure.
+    assert!(positions
+        .iter()
+        .all(|p| classify_position(p, &cfg) == Risk::Unknown));
+    let report = render_report(&positions, &cfg);
+    assert!(report.contains("no-line") && report.contains("measured"));
 }
