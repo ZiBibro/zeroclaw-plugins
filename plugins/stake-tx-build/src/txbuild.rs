@@ -445,8 +445,12 @@ pub fn validate_vote(
                 );
             }
             if !cfg.allowed_vote_accounts.iter().any(|v| v == &vote) {
+                // The format is named in the refusal itself. Without it a model
+                // relaying this error to the operator invents a shape, and the
+                // one it reaches for is a TOML array, which this parser rejects.
                 return Err(format!(
-                    "vote account `{vote}` is not in the configured allowed_vote_accounts allowlist"
+                    "vote account `{vote}` is not in the configured allowed_vote_accounts allowlist \
+                     (a comma-separated string of vote account pubkeys, not a TOML array)"
                 ));
             }
             Ok(Some(vote))
