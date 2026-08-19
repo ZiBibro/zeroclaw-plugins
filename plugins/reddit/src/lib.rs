@@ -23,7 +23,7 @@ pub mod reddit;
 #[cfg(target_family = "wasm")]
 mod component {
     wit_bindgen::generate!({
-        path: "../../wit/v0",
+        path: "../../wit/unstable",
         world: "channel-plugin",
         features: ["plugins-wit-v0"],
     });
@@ -170,7 +170,7 @@ mod component {
             let cfg = CONFIG.with(|c| c.borrow().clone());
             if !cfg.has_credentials() {
                 return Err(
-                    "reddit: no client_id/client_secret/refresh_token configured".to_string()
+                    "reddit: no client_id/client_secret/refresh_token configured".to_string(),
                 );
             }
             let token = ensure_token(&cfg)?;
