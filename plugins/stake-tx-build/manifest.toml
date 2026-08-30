@@ -53,8 +53,9 @@ type = "string"
 description = "Cluster the endpoint must match, checked by genesis hash. Defaults to mainnet-beta, the strictest reading of an operator who did not say."
 enum = ["mainnet-beta", "devnet", "testnet"]
 
-# Also a JSON array as of 0.2.0. An empty list means no delegate target is
-# allowed at all, which is why omitting the key and setting it to [] differ.
+# Also a JSON array as of 0.2.0. An empty list and an omitted key mean the same
+# thing to the guest, and the meaning is the safe one: no delegate target is
+# allowed, so only deactivate can be built.
 [config_schema.properties.allowed_vote_accounts]
 type = "array"
 description = "Vote accounts a delegate may target. Omitted means none is allowed and only deactivate can be built."

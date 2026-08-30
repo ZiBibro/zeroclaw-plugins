@@ -101,7 +101,7 @@ Operator storage is still a string map, and the schema is what tells the host
 how to read each stored string. Set the two lists like this:
 
 ```bash
-key=$(zeroclaw plugin info lending-health)   # prints the zpi1_... instance key
+key=$(zeroclaw plugin info lending-health | grep -o 'zpi1_[A-Za-z0-9_-]*')   # the instance key
 zeroclaw config set "plugins.entries.$key.config.wallets" '["main:<pubkey>","cold:<pubkey>"]'
 zeroclaw config set "plugins.entries.$key.config.protocols" '["kamino"]'
 ```

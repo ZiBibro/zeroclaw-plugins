@@ -62,7 +62,7 @@ Operator storage is still a string map, and the schema is what tells the host
 how to read each stored string. Set the two allowlists like this:
 
 ```bash
-key=$(zeroclaw plugin info stake-tx-build)   # prints the zpi1_... instance key
+key=$(zeroclaw plugin info stake-tx-build | grep -o 'zpi1_[A-Za-z0-9_-]*')   # the instance key
 zeroclaw config set "plugins.entries.$key.config.stake_accounts" '["main:<pubkey>"]'
 zeroclaw config set "plugins.entries.$key.config.allowed_vote_accounts" '["<vote pubkey>"]'
 ```
@@ -236,7 +236,7 @@ approved validators:
 
 ```
 success=false
-error: vote account `5btPEka74QyPuY7Yj6wks8oHHLFMqHWFiRraSLzUB5Ev` is not in the configured allowed_vote_accounts allowlist (a comma-separated string of vote account pubkeys, not a TOML array)
+error: vote account `5btPEka74QyPuY7Yj6wks8oHHLFMqHWFiRraSLzUB5Ev` is not in the configured allowed_vote_accounts allowlist (a quoted string holding a JSON array of vote account pubkeys, not a bare TOML array)
 ```
 
 The `deactivate`, naming a stake account the config never mentions:

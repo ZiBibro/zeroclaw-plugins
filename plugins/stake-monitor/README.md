@@ -97,7 +97,7 @@ Operator storage is still a string map, and the schema is what tells the host
 how to read each stored string. Set the allowlist like this:
 
 ```bash
-key=$(zeroclaw plugin info stake-monitor)   # prints the zpi1_... instance key
+key=$(zeroclaw plugin info stake-monitor | grep -o 'zpi1_[A-Za-z0-9_-]*')   # the instance key
 zeroclaw config set "plugins.entries.$key.config.stake_accounts" '["main:<pubkey>","cold:<pubkey>"]'
 zeroclaw config set "plugins.entries.$key.config.vote_lag_warn_slots" '8'
 ```
@@ -231,7 +231,10 @@ which is the section the `config_read` permission unlocks:
 
 ```toml
 [[plugins.entries]]
-name = "stake-monitor"
+# The instance key `zeroclaw plugin info stake-monitor` prints, not the
+# package name: the host consults entries by that key and silently ignores
+# an entry named after the package.
+name = "zpi1_WyJzdGFrZS1tb25pdG9yIiwidG9vbCIsInN0YWtlLW1vbml0b3IiXQ"
 
 [plugins.entries.config]
 stake_accounts = '["main:6ySLTQWEpCFKPYKfPaKYnhKzEccuqKafFEzfJVQ4Gifp"]'
