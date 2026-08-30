@@ -138,6 +138,7 @@ fn parse_row(
         account,
         deposit_usd,
         borrow_usd,
+        borrow_measured: borrow.is_some(),
         liquidation,
         // The portfolio response carries no protocol-side liquidatable flag;
         // the ratio it does carry is the whole verdict here.

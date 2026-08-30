@@ -11,8 +11,7 @@
 //! epoch progress are derived from fields those same replies already carry,
 //! so neither reading costs an extra call.
 
-use std::collections::HashMap;
-
+use serde::Deserialize;
 use serde_json::Value;
 
 /// Hard cap for the delivered payload, in characters: the rendered report and
@@ -25,13 +24,41 @@ pub const REPORT_CHAR_CAP: usize = 900;
 /// failed reads still leaves two thirds of the payload to them.
 const ISSUE_CHAR_BUDGET: usize = REPORT_CHAR_CAP / 3;
 
+/// Bounds an error string to [`REPORT_CHAR_CAP`] before it is handed back to the
+/// agent.
+///
+/// The report path has been capped since the beginning; the failure path was
+/// not, and several failure messages interpolate a value the model chose. A call
+/// carrying a multi-kilobyte argument got that argument back in full, so the
+/// bound the threat model claims held on one path and not the other. Truncation
+/// is on a character boundary, because the interpolated value can carry
+/// multi-byte text and a byte-sliced string is not a string.
+pub fn cap_failure(message: String) -> String {
+    if message.chars().count() <= REPORT_CHAR_CAP {
+        return message;
+    }
+    const MARKER: &str = "… (truncated)";
+    let keep = REPORT_CHAR_CAP.saturating_sub(MARKER.chars().count());
+    let mut out: String = message.chars().take(keep).collect();
+    out.push_str(MARKER);
+    out
+}
+
 const ISSUE_PREFIX: &str = "\nData issues: ";
 
 const ISSUE_SEPARATOR: &str = "; ";
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
-const CONFIG_KEYS: [&str; 4] = [
+/// Every key this plugin reads out of its own config section.
+///
+/// Since the host began validating typed instance config, the guest no longer
+/// polices unknown keys: `additionalProperties = false` in `manifest.toml`
+/// rejects an undeclared key before the component starts. What this array is
+/// for now is the test that reads `manifest.toml` and asserts the schema
+/// declares exactly these keys, so a key added here and forgotten there fails
+/// the build rather than the operator's first run.
+pub const CONFIG_KEYS: [&str; 4] = [
     "stake_accounts",
     "rpc_url",
     "vote_lag_warn_slots",
@@ -71,25 +98,64 @@ pub struct Config {
     pub timeout_secs: u64,
 }
 
-impl Config {
-    /// Parses the host-injected `__config` section. Fail-closed: any unknown
-    /// key is an error, so a typo surfaces immediately.
-    pub fn from_section(section: &HashMap<String, String>) -> Result<Self, String> {
-        for key in section.keys() {
-            if !CONFIG_KEYS.contains(&key.as_str()) {
-                return Err(format!(
-                    "unknown config key `{key}`; expected one of: {}",
-                    CONFIG_KEYS.join(", ")
-                ));
-            }
-        }
+/// The shape of this plugin's config section as the host now hands it over.
+///
+/// Since zeroclaw-labs/zeroclaw#9126 the host validates the operator's values
+/// against `[config_schema]` in `manifest.toml` and injects a *typed* JSON
+/// object, so the allowlist arrives as an array and the thresholds as integers,
+/// and there is no string splitting left for the guest to do.
+///
+/// Deliberately not `deny_unknown_fields`: `additionalProperties = false` in
+/// the manifest already refuses an undeclared key before the component starts,
+/// so guest-side strictness would add no protection and would turn a
+/// forward-compatible schema addition into a hard failure.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawConfig {
+    stake_accounts: Option<Vec<String>>,
+    rpc_url: Option<String>,
+    vote_lag_warn_slots: Option<u64>,
+    timeout_secs: Option<u64>,
+}
 
-        let accounts = parse_accounts(section.get("stake_accounts").ok_or(
-            "config key `stake_accounts` is required: a comma-separated allowlist like `main:<pubkey>` or bare pubkeys",
+/// Describes a config deserialization failure without quoting the value that
+/// caused it.
+///
+/// `serde_json::Error`'s `Display` embeds the offending value. Config values
+/// here are stake pubkeys and the operator's own RPC endpoint, which the host
+/// stores secret-marked and encrypted at rest, so echoing one into a
+/// `ToolResult` would hand it straight back to the model.
+fn describe_error(error: &serde_json::Error) -> String {
+    format!(
+        "config does not match the declared schema: {:?} error at line {} column {}",
+        error.classify(),
+        error.line(),
+        error.column()
+    )
+}
+
+impl Config {
+    /// Parses the typed `__config` object the host injects.
+    ///
+    /// Both `stake_accounts` and `rpc_url` are `required` in the schema, so a
+    /// schema-enforcing host never reaches the missing-key branches. They stay
+    /// because host-side `cargo test` runs with no schema validation at all,
+    /// and because a reader with no allowlist has nothing it is permitted to
+    /// read.
+    pub fn from_json(config: &Value) -> Result<Self, String> {
+        let raw: RawConfig = if config.is_null() {
+            RawConfig::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|error| describe_error(&error))?
+        };
+
+        let accounts = parse_accounts(raw.stake_accounts.as_deref().ok_or(
+            "config key `stake_accounts` is required: an allowlist array like [\"main:<pubkey>\"] or bare pubkeys",
         )?)?;
 
-        let rpc_url = section
-            .get("rpc_url")
+        let rpc_url = raw
+            .rpc_url
+            .as_deref()
             .ok_or("config key `rpc_url` is required")?
             .trim()
             .trim_end_matches('/')
@@ -98,25 +164,16 @@ impl Config {
             return Err(format!("rpc_url must be an https:// URL, got `{rpc_url}`"));
         }
 
-        let vote_lag_warn_slots = match section.get("vote_lag_warn_slots") {
-            Some(raw) => raw.trim().parse::<u64>().map_err(|_| {
-                format!("vote_lag_warn_slots must be a positive integer, got `{raw}`")
-            })?,
-            None => DEFAULT_VOTE_LAG_WARN_SLOTS,
-        };
+        let vote_lag_warn_slots = raw
+            .vote_lag_warn_slots
+            .unwrap_or(DEFAULT_VOTE_LAG_WARN_SLOTS);
         if vote_lag_warn_slots == 0 || vote_lag_warn_slots > DELINQUENT_SLOT_DISTANCE {
             return Err(format!(
                 "vote_lag_warn_slots must be between 1 and {DELINQUENT_SLOT_DISTANCE}, got {vote_lag_warn_slots}"
             ));
         }
 
-        let timeout_secs = match section.get("timeout_secs") {
-            Some(raw) => raw
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| format!("timeout_secs must be a positive integer, got `{raw}`"))?,
-            None => DEFAULT_TIMEOUT_SECS,
-        };
+        let timeout_secs = raw.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
         if timeout_secs == 0 || timeout_secs > 60 {
             return Err(format!(
                 "timeout_secs must be between 1 and 60, got {timeout_secs}"
@@ -164,11 +221,11 @@ impl Config {
     }
 }
 
-fn parse_accounts(raw: &str) -> Result<Vec<StakeAccountRef>, String> {
+fn parse_accounts(entries: &[String]) -> Result<Vec<StakeAccountRef>, String> {
     let mut out = Vec::new();
-    for (i, entry) in raw
-        .split(',')
-        .map(str::trim)
+    for (i, entry) in entries
+        .iter()
+        .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .enumerate()
     {
@@ -485,11 +542,15 @@ pub fn parse_stake_account(body: &str) -> Result<StakeState, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidatorStatus {
     Ok {
-        commission_bps: u64,
+        /// `None` when the reply carried neither `inflationRewardsCommissionBps`
+        /// nor a numeric `commission`. Rendering an unread commission as 0.0%
+        /// would put it beside genuine 0% validators with nothing to tell them
+        /// apart, and 0% is the most favourable reading available.
+        commission_bps: Option<u64>,
         last_vote_slot: Option<u64>,
     },
     Delinquent {
-        commission_bps: u64,
+        commission_bps: Option<u64>,
         last_vote_slot: Option<u64>,
     },
     Unknown,
@@ -523,6 +584,16 @@ impl ValidatorStatus {
     }
 }
 
+/// Renders a commission for a report line. An unread one says so; rendering it
+/// as `0.0%` would be indistinguishable from a genuine zero-fee validator, and
+/// the published reports carry both kinds of row side by side.
+fn fmt_commission(commission_bps: Option<u64>) -> String {
+    match commission_bps {
+        Some(bps) => format!("fee {:.1}%", bps as f64 / 100.0),
+        None => "fee unknown".to_string(),
+    }
+}
+
 /// Reads a `getVoteAccounts` reply that was filtered by `votePubkey`.
 /// Commission is taken from `inflationRewardsCommissionBps` when present,
 /// with the legacy percentage `commission` as the fallback, because the
@@ -532,17 +603,24 @@ impl ValidatorStatus {
 /// whole chain history, so it is read as unknown.
 pub fn parse_vote_status(body: &str, voter: &str) -> Result<ValidatorStatus, String> {
     let r = rpc_result(body)?;
-    let pick = |list: &str| -> Option<(u64, Option<u64>)> {
+    let pick = |list: &str| -> Option<(Option<u64>, Option<u64>)> {
         r.get(list)?
             .as_array()?
             .iter()
             .find(|v| v.get("votePubkey").and_then(Value::as_str) == Some(voter))
             .map(|v| {
+                // A commission nobody could read must not render as 0.0%, the
+                // most favourable value there is, beside genuine 0% validators
+                // in the same report. `saturating_mul` because the legacy
+                // percentage arrives from the endpoint and 100 * u64::MAX is
+                // not a commission.
                 let commission_bps = v
                     .get("inflationRewardsCommissionBps")
                     .and_then(Value::as_u64)
-                    .unwrap_or_else(|| {
-                        v.get("commission").and_then(Value::as_u64).unwrap_or(0) * 100
+                    .or_else(|| {
+                        v.get("commission")
+                            .and_then(Value::as_u64)
+                            .map(|pct| pct.saturating_mul(100))
                     });
                 let last_vote_slot = v
                     .get("lastVote")
@@ -800,7 +878,11 @@ fn render_within(entries: &[Entry], epoch: &EpochInfo, cfg: &Config, budget: usi
             )
         })
         .map(|e| e.state.delegation.as_ref().map_or(0, |d| d.stake_lamports))
-        .sum();
+        // Saturating, because the lamport values come from the endpoint and the
+        // release profile turns overflow checks off, so a wrapped sum would
+        // print a small confident number for an absurd input. The neighbouring
+        // epoch percentage already widens to u128 against the same threat.
+        .fold(0u64, u64::saturating_add);
     let delinquent = entries
         .iter()
         .filter(|e| matches!(e.validator, Some(ValidatorStatus::Delinquent { .. })))
@@ -877,9 +959,9 @@ fn render_within(entries: &[Entry], epoch: &EpochInfo, cfg: &Config, budget: usi
             let vstat = match &e.validator {
                 Some(v @ ValidatorStatus::Ok { commission_bps, .. }) => {
                     format!(
-                        "validator {voter_short}.. ok, {}, fee {:.1}%",
+                        "validator {voter_short}.. ok, {}, {}",
                         fmt_vote_lag(v, epoch, cfg.vote_lag_warn_slots),
-                        *commission_bps as f64 / 100.0
+                        fmt_commission(*commission_bps)
                     )
                 }
                 Some(v @ ValidatorStatus::Delinquent { .. }) => {

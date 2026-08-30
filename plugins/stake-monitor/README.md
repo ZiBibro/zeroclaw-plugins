@@ -80,17 +80,33 @@ that the operator already placed on the allowlist.
 
 ## Config keys
 
-The operator configures the plugin by name; the host resolves that one section
-and hands the plugin a flat `string -> string` map, injected as `__config`. This
-only happens because the manifest requests the `config_read` permission. The
-plugin refuses to run without a configured allowlist.
+`manifest.toml` carries a closed Draft 2020-12 `config_schema` naming every key
+below. The host rejects a manifest that requests `config_read` without one, and
+it validates the operator's stored values against the schema before injecting
+them into `execute` arguments as a typed `__config` object. The plugin refuses
+to run without a configured allowlist.
 
-| Key | Required | Default | Meaning |
-|---|---|---|---|
-| `stake_accounts` | yes | — | Comma-separated allowlist. Each entry is `label:pubkey`, or a bare pubkey that is auto-labelled `stake1`, `stake2`, and so on. At least one valid base58 pubkey is required. |
-| `rpc_url` | yes | — | The operator's own Solana JSON-RPC endpoint. Must be `https://`. A trailing slash is trimmed. |
-| `vote_lag_warn_slots` | no | `32` | Vote lag, in slots, past which a still-voting validator is flagged `BEHIND`. Bounded to 1 through 128, the delinquency distance the RPC applies on its own. |
-| `timeout_secs` | no | `10` | Per-request connect timeout in seconds, bounded to 1 through 60. |
+| Key | Schema type | Required | Default | Meaning |
+|---|---|---|---|---|
+| `stake_accounts` | `array` of `string` | yes | — | Allowlist. Each entry is `label:pubkey`, or a bare pubkey that is auto-labelled `stake1`, `stake2`, and so on. At least one valid base58 pubkey is required. |
+| `rpc_url` | `string` | yes | — | The operator's own Solana JSON-RPC endpoint. Must be `https://`. A trailing slash is trimmed. |
+| `vote_lag_warn_slots` | `integer` | no | `32` | Vote lag, in slots, past which a still-voting validator is flagged `BEHIND`. Bounded to 1 through 128, the delinquency distance the RPC applies on its own. |
+| `timeout_secs` | `integer` | no | `10` | Per-request connect timeout in seconds, bounded to 1 through 60. |
+
+Operator storage is still a string map, and the schema is what tells the host
+how to read each stored string. Set the allowlist like this:
+
+```bash
+key=$(zeroclaw plugin info stake-monitor)   # prints the zpi1_... instance key
+zeroclaw config set "plugins.entries.$key.config.stake_accounts" '["main:<pubkey>","cold:<pubkey>"]'
+zeroclaw config set "plugins.entries.$key.config.vote_lag_warn_slots" '8'
+```
+
+**Breaking change in 0.2.0.** `stake_accounts` was a comma-separated string
+before this release and is a JSON array now, while `vote_lag_warn_slots` and
+`timeout_secs` are real integers. The host rejects the old encoding rather than
+reading it as one malformed entry, so an operator upgrading from 0.1.0 has to
+rewrite the allowlist value.
 
 ## Threat model
 
@@ -104,9 +120,11 @@ plugin refuses to run without a configured allowlist.
   silently ignored typo, which surfaces a misspelled key immediately. `rpc_url`
   must be `https://`, and both `vote_lag_warn_slots` and `timeout_secs` are
   range-bounded.
-- **Authoritative commission.** Commission is read from `commissionBps`, the
-  authoritative field. The legacy `commission` percentage can be null even when a
-  reward exists, so it is used only as a fallback.
+- **Authoritative commission.** The commission a report line prints is read
+  from `inflationRewardsCommissionBps`, the authoritative field. The legacy
+  `commission` percentage can be null even when a reward exists, so it is used
+  only as a fallback, and a reply carrying neither prints `fee unknown` rather
+  than the most favourable reading available.
 - **No invented numbers.** A degraded reply never becomes a reassuring figure. A
   vote record with no `lastVote`, or the `0` an account that has never voted
   reports, prints `vote lag unknown` rather than a lag of zero. A `getEpochInfo`

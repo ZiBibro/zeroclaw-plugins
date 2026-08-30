@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-
-use lending_health::health::{render_report, Config, Protocol};
+use lending_health::health::{classify_position, render_report, Config, Protocol, Risk};
 use lending_health::kamino::{iso_to_epoch, parse_portfolio, portfolio_url};
 
 const ACTIVE: &str = include_str!("fixtures/kamino_portfolio_active.json");
@@ -11,13 +9,11 @@ const EMPTY: &str = include_str!("fixtures/kamino_portfolio_empty.json");
 const WALLET: &str = "86xCnPeV69n6t3DnyGvkKobf9FdN2H9oiVDdaMpo2MMY";
 
 fn kamino_only_config() -> Config {
-    let section: HashMap<String, String> = [
-        ("wallets".to_string(), format!("main:{WALLET}")),
-        ("protocols".to_string(), "kamino".to_string()),
-    ]
-    .into_iter()
-    .collect();
-    Config::from_section(&section).expect("test config")
+    Config::from_json(&serde_json::json!({
+        "wallets": [format!("main:{WALLET}")],
+        "protocols": ["kamino"],
+    }))
+    .expect("test config")
 }
 
 /// One lending row with caller-chosen JSON literals for the two amounts, so a
@@ -342,6 +338,55 @@ fn a_wallet_at_its_line_is_never_reported_as_holding_nothing() {
         report.contains("(deposit value unreadable)"),
         "report: {report}"
     );
+}
+
+/// The mirror of the case above, and it failed in a worse way for longer. An
+/// unreadable BORROW substitutes 0, and the substituted zero used to reach the
+/// verdict through the `no debt` shortcut: this row sits at 0.74 against a 0.75
+/// line, 1.3% of buffer left, and rendered `[OK] ... no debt` under a header of
+/// `worst risk OK`, the safest state this report can show. A zero nobody
+/// measured is not a measured zero.
+#[test]
+fn an_unreadable_borrow_is_never_reported_as_no_debt() {
+    let cfg = kamino_only_config();
+    let positions = parse_portfolio(&one_row("\"53724.48\"", "\"NaN\""), "main").expect("parses");
+    assert!(
+        !positions[0].borrow_measured,
+        "the substituted zero must be marked unmeasured"
+    );
+    assert_eq!(
+        classify_position(&positions[0], &cfg),
+        Risk::Critical,
+        "0.74 against a 0.75 line is 1.3% of buffer, not OK"
+    );
+    let report = render_report(&positions, &cfg);
+    assert!(
+        !report.contains("no debt"),
+        "an unmeasured borrow must not read as no debt: {report}"
+    );
+    assert!(report.contains("[CRITICAL]"), "report: {report}");
+    assert!(
+        report.contains("LTV 74.0% of 75.0% liq"),
+        "report: {report}"
+    );
+    assert!(
+        report.contains("(borrow value unreadable)"),
+        "report: {report}"
+    );
+}
+
+/// The other direction of the same rule, so it cannot be satisfied by refusing
+/// every zero: a borrow that was read and is genuinely zero still earns the
+/// `no debt` line, which is the safest state a position can be in.
+#[test]
+fn a_measured_zero_borrow_still_reads_as_no_debt() {
+    let cfg = kamino_only_config();
+    let positions = parse_portfolio(&one_row("\"843.0\"", "\"0\""), "main").expect("parses");
+    assert!(positions[0].borrow_measured);
+    assert_eq!(classify_position(&positions[0], &cfg), Risk::Ok);
+    let report = render_report(&positions, &cfg);
+    assert!(report.contains("no debt"), "report: {report}");
+    assert!(!report.contains("unreadable"), "report: {report}");
 }
 
 /// The other half of the rule: a row with neither amount readable measures

@@ -23,7 +23,6 @@ mod component {
         features: ["plugins-wit-v0"],
     });
 
-    use std::collections::HashMap;
     use std::time::Duration;
 
     use crate::txbuild::{self, build_transaction, parse_action, validate_vote, Config};
@@ -44,8 +43,14 @@ mod component {
         stake_account: String,
         #[serde(default)]
         vote_account: Option<String>,
+        /// The host merges this plugin's validated config object into the
+        /// call arguments under the reserved `__config` key, after deleting
+        /// any model-supplied value of that name. It is captured as a raw
+        /// `Value` so a config-shaped problem is reported as a config error
+        /// rather than collapsing the whole argument parse into "invalid
+        /// arguments".
         #[serde(rename = "__config", default)]
-        config: HashMap<String, String>,
+        config: serde_json::Value,
     }
 
     impl PluginInfo for StakeTxBuild {
@@ -101,7 +106,7 @@ mod component {
                 Err(e) => return fail(format!("invalid arguments: {e}")),
             };
 
-            let cfg = match Config::from_section(&parsed.config) {
+            let cfg = match Config::from_json(&parsed.config) {
                 Ok(c) => c,
                 Err(e) => return fail(format!("config error: {e}")),
             };

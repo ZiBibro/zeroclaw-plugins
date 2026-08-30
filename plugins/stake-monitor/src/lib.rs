@@ -20,7 +20,6 @@ mod component {
         features: ["plugins-wit-v0"],
     });
 
-    use std::collections::HashMap;
     use std::time::Duration;
 
     use crate::stake::{
@@ -41,8 +40,14 @@ mod component {
     struct ExecuteArgs {
         #[serde(default)]
         account: Option<String>,
+        /// The host merges this plugin's validated config object into the
+        /// call arguments under the reserved `__config` key, after deleting
+        /// any model-supplied value of that name. It is captured as a raw
+        /// `Value` so a config-shaped problem is reported as a config error
+        /// rather than collapsing the whole argument parse into "invalid
+        /// arguments".
         #[serde(rename = "__config", default)]
-        config: HashMap<String, String>,
+        config: serde_json::Value,
     }
 
     impl PluginInfo for StakeMonitor {
@@ -88,7 +93,7 @@ mod component {
                 Err(e) => return fail(format!("invalid arguments: {e}")),
             };
 
-            let cfg = match Config::from_section(&parsed.config) {
+            let cfg = match Config::from_json(&parsed.config) {
                 Ok(c) => c,
                 Err(e) => return fail(format!("config error: {e}")),
             };
@@ -252,6 +257,10 @@ mod component {
     }
 
     fn fail(message: String) -> Result<ToolResult, String> {
+        // The same 900-character bound the report path carries. Several failure
+        // messages interpolate a value the caller supplied, so without this the
+        // failure path is the wider door into the agent's context.
+        let message = crate::stake::cap_failure(message);
         emit(PluginAction::Fail, PluginOutcome::Failure, &message);
         Ok(ToolResult {
             success: false,

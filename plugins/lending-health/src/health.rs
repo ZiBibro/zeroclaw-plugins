@@ -4,7 +4,8 @@
 //! touches the network or the wasm bindings, so `cargo test` on the host
 //! exercises all of it.
 
-use std::collections::HashMap;
+use serde::Deserialize;
+use serde_json::Value;
 
 /// Hard cap for the delivered payload, in characters. Keeps the tool output
 /// around 200 tokens so a scheduled briefing never floods the agent context.
@@ -17,6 +18,26 @@ const ISSUES_CHAR_BUDGET: usize = REPORT_CHAR_CAP / 4;
 
 /// Room kept for the closing line of a truncated report.
 const OMISSION_LINE_RESERVE: usize = 40;
+
+/// Bounds an error string to [`REPORT_CHAR_CAP`] before it is handed back to the
+/// agent.
+///
+/// The report path has been capped since the beginning; the failure path was
+/// not, and several failure messages interpolate a value the model chose. A call
+/// carrying a multi-kilobyte `wallet` argument got that argument back in full,
+/// so the bound the threat model claims held on one path and not the other.
+/// Truncation is on a character boundary, because the interpolated value can
+/// carry multi-byte text and a byte-sliced string is not a string.
+pub fn cap_failure(message: String) -> String {
+    if message.chars().count() <= REPORT_CHAR_CAP {
+        return message;
+    }
+    const MARKER: &str = "… (truncated)";
+    let keep = REPORT_CHAR_CAP.saturating_sub(MARKER.chars().count());
+    let mut out: String = message.chars().take(keep).collect();
+    out.push_str(MARKER);
+    out
+}
 
 /// Room kept for the `(+N more)` marker of a trimmed data-issues line.
 const OMISSION_MARKER_RESERVE: usize = 16;
@@ -42,7 +63,15 @@ pub const DEFAULT_WARN_LIQUIDATION_BUFFER: f64 = 0.15;
 pub const DEFAULT_CRITICAL_LIQUIDATION_BUFFER: f64 = 0.05;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
-const CONFIG_KEYS: [&str; 7] = [
+/// Every key this plugin reads out of its own config section.
+///
+/// Since the host began validating typed instance config, the guest no longer
+/// polices unknown keys: `additionalProperties = false` in `manifest.toml`
+/// rejects an undeclared key before the component starts. What this array is
+/// for now is the test that reads `manifest.toml` and asserts the schema
+/// declares exactly these keys, so a key added here and forgotten there fails
+/// the build rather than the operator's first run.
+pub const CONFIG_KEYS: [&str; 7] = [
     "wallets",
     "rpc_url",
     "kamino_api_base",
@@ -78,8 +107,9 @@ impl Protocol {
     /// against a per-reserve liquidation threshold. MarginFi has no equivalent
     /// figure, so its ratio is maintenance-weighted liabilities over
     /// maintenance-weighted assets, liquidatable at 1.0. Both land in one
-    /// column, and the dollar amounts printed beside them are unweighted in
-    /// both cases. Without a label the MarginFi line invites an operator to
+    /// column, and in neither case do the dollar amounts beside them share the
+    /// ratio's basis: Kamino prints its plain position values, MarginFi the
+    /// health cache's initial-weight pair. Without a label the MarginFi line invites an operator to
     /// divide $5,000 by $10,000, get 50%, and read the 75% next to it as a bug.
     /// The percentage is correct on its own basis; the column now says which.
     pub fn ltv_basis_prefix(self) -> &'static str {
@@ -103,32 +133,61 @@ pub struct Config {
     pub timeout_secs: u64,
 }
 
+/// The shape of this plugin's config section as the host now hands it over.
+///
+/// Since zeroclaw-labs/zeroclaw#9126 the host validates the operator's values
+/// against `[config_schema]` in `manifest.toml` and injects a *typed* JSON
+/// object, so lists arrive as arrays and thresholds as numbers, and there is no
+/// string splitting left for the guest to do. Storage on the operator's side is
+/// still a string map; the schema is what tells the host to read `["a","b"]` as
+/// an array before the guest ever sees it.
+///
+/// Deliberately not `deny_unknown_fields`: `additionalProperties = false` in
+/// the manifest already refuses an undeclared key before the component starts,
+/// so guest-side strictness would add no protection and would turn a
+/// forward-compatible schema addition into a hard failure.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawConfig {
+    wallets: Option<Vec<String>>,
+    rpc_url: Option<String>,
+    kamino_api_base: Option<String>,
+    protocols: Option<Vec<String>>,
+    warn_liquidation_buffer: Option<f64>,
+    critical_liquidation_buffer: Option<f64>,
+    timeout_secs: Option<u64>,
+}
+
 impl Config {
-    /// Parses the host-injected `__config` section. Fail-closed: any unknown
-    /// key is an error, so a typo like `warn_ltw` surfaces immediately
-    /// instead of silently falling back to a default threshold.
-    pub fn from_section(section: &HashMap<String, String>) -> Result<Self, String> {
-        for key in section.keys() {
-            if !CONFIG_KEYS.contains(&key.as_str()) {
-                return Err(format!(
-                    "unknown config key `{key}`; expected one of: {}",
-                    CONFIG_KEYS.join(", ")
-                ));
-            }
-        }
+    /// Parses the typed `__config` object the host injects.
+    ///
+    /// `wallets` is `required` in the schema, so a host that enforces the
+    /// schema never reaches the missing-wallets branch below. The branch stays
+    /// because this same code has to fail closed when it is exercised
+    /// host-side by `cargo test`, where no schema validation runs at all.
+    ///
+    /// A JSON null is a host that injected nothing rather than a malformed
+    /// object, and it lands on the same required-key error: without an
+    /// allowlist this plugin has no wallet it is permitted to read.
+    pub fn from_json(config: &Value) -> Result<Self, String> {
+        let raw: RawConfig = if config.is_null() {
+            RawConfig::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|error| describe_error(&error))?
+        };
 
         let wallets = parse_wallets(
-            section
-                .get("wallets")
-                .ok_or("config key `wallets` is required: a comma-separated allowlist like `main:<pubkey>` or bare pubkeys")?,
+            raw.wallets
+                .as_deref()
+                .ok_or("config key `wallets` is required: an allowlist array like [\"main:<pubkey>\"] or bare pubkeys")?,
         )?;
 
-        let protocols = match section.get("protocols") {
-            Some(raw) => parse_protocols(raw)?,
+        let protocols = match raw.protocols.as_deref() {
+            Some(names) => parse_protocols(names)?,
             None => vec![Protocol::Kamino, Protocol::Marginfi],
         };
 
-        let rpc_url = match section.get("rpc_url") {
+        let rpc_url = match raw.rpc_url.as_deref() {
             Some(u) => Some(parse_https_url(u, "rpc_url")?),
             None => None,
         };
@@ -140,18 +199,18 @@ impl Config {
             );
         }
 
-        let kamino_api_base = match section.get("kamino_api_base") {
+        let kamino_api_base = match raw.kamino_api_base.as_deref() {
             Some(u) => parse_https_url(u, "kamino_api_base")?,
             None => DEFAULT_KAMINO_API_BASE.to_string(),
         };
 
-        let warn_liquidation_buffer = parse_ratio(
-            section.get("warn_liquidation_buffer"),
+        let warn_liquidation_buffer = check_ratio(
+            raw.warn_liquidation_buffer,
             "warn_liquidation_buffer",
             DEFAULT_WARN_LIQUIDATION_BUFFER,
         )?;
-        let critical_liquidation_buffer = parse_ratio(
-            section.get("critical_liquidation_buffer"),
+        let critical_liquidation_buffer = check_ratio(
+            raw.critical_liquidation_buffer,
             "critical_liquidation_buffer",
             DEFAULT_CRITICAL_LIQUIDATION_BUFFER,
         )?;
@@ -164,13 +223,7 @@ impl Config {
             ));
         }
 
-        let timeout_secs = match section.get("timeout_secs") {
-            Some(raw) => raw
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| format!("timeout_secs must be a positive integer, got `{raw}`"))?,
-            None => DEFAULT_TIMEOUT_SECS,
-        };
+        let timeout_secs = raw.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
         if timeout_secs == 0 || timeout_secs > 60 {
             return Err(format!(
                 "timeout_secs must be between 1 and 60, got {timeout_secs}"
@@ -218,11 +271,30 @@ impl Config {
     }
 }
 
-fn parse_wallets(raw: &str) -> Result<Vec<Wallet>, String> {
+/// Describes a config deserialization failure without quoting the value that
+/// caused it.
+///
+/// `serde_json::Error`'s `Display` embeds the offending value ("invalid type:
+/// string `...`"). Config values here are wallet pubkeys and an operator's own
+/// RPC endpoint, which the host stores secret-marked and encrypted at rest, so
+/// echoing one into a `ToolResult` would hand it straight back to the model.
+/// The category and the position are enough to debug the only thing that can
+/// still produce this error on a schema-enforcing host: a manifest that
+/// disagrees with the guest.
+fn describe_error(error: &serde_json::Error) -> String {
+    format!(
+        "config does not match the declared schema: {:?} error at line {} column {}",
+        error.classify(),
+        error.line(),
+        error.column()
+    )
+}
+
+fn parse_wallets(entries: &[String]) -> Result<Vec<Wallet>, String> {
     let mut out = Vec::new();
-    for (i, entry) in raw
-        .split(',')
-        .map(str::trim)
+    for (i, entry) in entries
+        .iter()
+        .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .enumerate()
     {
@@ -255,10 +327,13 @@ fn parse_wallets(raw: &str) -> Result<Vec<Wallet>, String> {
 /// it removes, these it does not.
 fn reject_invisible(value: &str, what: &str) -> Result<(), String> {
     for (i, ch) in value.char_indices() {
+        // U+2028 and U+2029 are Zl and Zp rather than Cc, so `is_control` misses
+        // them, and they break a line in most renderers.
         let invisible = ch.is_control()
             || matches!(
                 ch,
-                '\u{00ad}' | '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}'
+                '\u{00ad}' | '\u{200b}'
+                    ..='\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{2060}' | '\u{feff}'
             );
         if invisible {
             return Err(format!(
@@ -290,9 +365,9 @@ pub fn validate_pubkey(candidate: &str, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_protocols(raw: &str) -> Result<Vec<Protocol>, String> {
+fn parse_protocols(names: &[String]) -> Result<Vec<Protocol>, String> {
     let mut out = Vec::new();
-    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+    for entry in names.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let proto = match entry.to_ascii_lowercase().as_str() {
             "kamino" => Protocol::Kamino,
             "marginfi" => Protocol::Marginfi,
@@ -320,14 +395,17 @@ fn parse_https_url(raw: &str, key: &str) -> Result<String, String> {
     Ok(url)
 }
 
-fn parse_ratio(raw: Option<&String>, key: &str, default: f64) -> Result<f64, String> {
-    match raw {
+/// Bounds a threshold that arrives already typed as a number.
+///
+/// The schema states the same bounds, so on a schema-enforcing host an
+/// out-of-range value never reaches here. The check stays because host-side
+/// `cargo test` runs with no schema at all, and because a NaN passes every
+/// JSON-Schema numeric keyword while failing the comparison the report is
+/// classified on.
+fn check_ratio(value: Option<f64>, key: &str, default: f64) -> Result<f64, String> {
+    match value {
         None => Ok(default),
-        Some(s) => {
-            let v = s
-                .trim()
-                .parse::<f64>()
-                .map_err(|_| format!("{key} must be a number between 0 and 1, got `{s}`"))?;
+        Some(v) => {
             if !(0.0..=1.0).contains(&v) {
                 return Err(format!("{key} must be between 0 and 1, got {v}"));
             }
@@ -417,8 +495,11 @@ pub fn classify_position(position: &Position, cfg: &Config) -> Risk {
     // position with a liquidation LTV of zero, since no line exists to report,
     // and reading that as an unmeasurable basis would label the safest possible
     // position UNKNOWN. Found on a live wallet: a deposit-only position rendered
-    // as "LTV 0.0% of 0.0% liq" under UNKNOWN.
-    if position.borrow_usd <= 0.0 {
+    // as "LTV 0.0% of 0.0% liq" under UNKNOWN. The zero has to be a measured
+    // one: when the borrow figure was unreadable the substituted 0.0 says
+    // nothing about the debt, so the row falls through to whatever basis was
+    // read, and to UNKNOWN when none was.
+    if position.borrow_measured && position.borrow_usd <= 0.0 {
         return Risk::Ok;
     }
     match position.liquidation {
@@ -447,6 +528,13 @@ pub struct Position {
     pub account: String,
     pub deposit_usd: f64,
     pub borrow_usd: f64,
+    /// `false` when the source carried no readable borrow figure and `0.0` was
+    /// substituted for it. The substitute must never reach a verdict: a zero
+    /// nobody measured is not the same fact as a measured zero, and treating it
+    /// as one reports a position sitting at its liquidation line as the safest
+    /// state there is. Every path that reads `no debt` out of `borrow_usd`
+    /// checks this first.
+    pub borrow_measured: bool,
     /// `None` when the source carried no usable basis, e.g. a MarginFi health
     /// cache with a zeroed maintenance pair. The report then states no
     /// liquidation distance at all.
@@ -615,8 +703,9 @@ fn render_within(positions: &[Position], cfg: &Config, cap: usize) -> String {
         // A deposit-only position has no ratio worth printing: the protocol
         // reports both its LTV and its liquidation line as zero, and
         // "LTV 0.0% of 0.0% liq" reads as a broken measurement rather than as
-        // the safest state a position can be in.
-        let distance = if p.borrow_usd <= 0.0 {
+        // the safest state a position can be in. An unreadable borrow figure
+        // does not earn that line; it prints whatever basis was read.
+        let distance = if p.borrow_measured && p.borrow_usd <= 0.0 {
             "no debt".to_string()
         } else {
             match p.liquidation {

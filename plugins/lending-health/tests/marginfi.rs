@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use base64::Engine;
 use lending_health::health::{classify_position, render_report, Config, Protocol, Risk};
 use lending_health::marginfi::{
@@ -31,16 +29,11 @@ fn account_bytes(fixture: &str) -> Vec<u8> {
 }
 
 fn config() -> Config {
-    let section: HashMap<String, String> = [
-        ("wallets".to_string(), format!("main:{AUTHORITY}")),
-        (
-            "rpc_url".to_string(),
-            "https://example-rpc.test".to_string(),
-        ),
-    ]
-    .into_iter()
-    .collect();
-    Config::from_section(&section).expect("test config")
+    Config::from_json(&serde_json::json!({
+        "wallets": [format!("main:{AUTHORITY}")],
+        "rpc_url": "https://example-rpc.test",
+    }))
+    .expect("test config")
 }
 
 #[test]
@@ -127,7 +120,7 @@ fn synthetic_maintenance_fixture_reports_a_distance() {
 fn synthetic_maintenance_fixture_renders_a_measured_line() {
     let positions = parse_gpa_response(GPA_MAINT_SYNTHETIC, "main").unwrap();
     let report = render_report(&positions, &config());
-    // The dollar figures are unweighted: 700/1000 is 70%, not the 75% printed
+    // The dollar figures come from the init-weight pair: 700/1000 is 70%, not the 75% printed
     // beside them. Both numbers are right on their own basis, so the line says
     // which basis the percentage uses rather than looking like a defect.
     // MarginFi liquidates when the maintenance-weighted ratio reaches 1.0, so
@@ -203,6 +196,29 @@ fn zeroed_account_is_skipped() {
 fn short_account_is_skipped() {
     let short = vec![0u8; 64];
     assert!(decode_account(&short, "pubkey", "main").is_none());
+}
+
+/// The request carries a dataSize filter and two memcmp filters, and the decoder
+/// used to trust the endpoint to have honoured them. A caching proxy that drops
+/// a filter, or a provider answering a different query, would then get any
+/// 2312-byte account decoded and reported under the operator's wallet label. The
+/// discriminator is in the first eight bytes already in hand, so it is re-checked
+/// here. This does not defend against an endpoint that lies, which could forge
+/// the field; the allowlist guarantee lives at request construction.
+#[test]
+fn an_account_that_is_not_a_marginfi_account_is_not_decoded() {
+    let real = account_bytes(GPA_MAINT_SYNTHETIC);
+    assert!(
+        decode_account(&real, "pubkey", "main").is_some(),
+        "the fixture itself must still decode"
+    );
+
+    let mut foreign = real.clone();
+    foreign[0] ^= 0xff;
+    assert!(
+        decode_account(&foreign, "pubkey", "main").is_none(),
+        "a wrong discriminator must not be decoded as a MarginfiAccount"
+    );
 }
 
 #[test]

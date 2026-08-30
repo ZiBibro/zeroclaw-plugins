@@ -2,8 +2,6 @@
 //! and the MarginFi capture come from different wallets, which is why the
 //! example labels both `demo`.
 
-use std::collections::HashMap;
-
 use lending_health::health::{render_report, Config};
 use lending_health::kamino::parse_portfolio;
 use lending_health::marginfi::parse_gpa_response;
@@ -19,19 +17,11 @@ Lending health: 4 position(s), worst risk WARN.
 [OK] demo kamino Vanilla@47tf #6FJt..SSLy: deposit $200638, borrow $125169, LTV 62.4% of 75.0% liq (positions stale 39 h)";
 
 fn config() -> Config {
-    let section: HashMap<String, String> = [
-        (
-            "wallets".to_string(),
-            "demo:AcNSmd5CtVEqL2CMDDKcC4Bp1rHRD9GcRxNJgcSHTxrb".to_string(),
-        ),
-        (
-            "rpc_url".to_string(),
-            "https://example-rpc.test".to_string(),
-        ),
-    ]
-    .into_iter()
-    .collect();
-    Config::from_section(&section).expect("test config")
+    Config::from_json(&serde_json::json!({
+        "wallets": ["demo:AcNSmd5CtVEqL2CMDDKcC4Bp1rHRD9GcRxNJgcSHTxrb"],
+        "rpc_url": "https://example-rpc.test",
+    }))
+    .expect("test config")
 }
 
 #[test]

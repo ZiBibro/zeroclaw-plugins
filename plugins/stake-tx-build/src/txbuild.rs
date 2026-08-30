@@ -13,14 +13,21 @@
 //! transactions only; it never sees a private key and it cannot sign or submit
 //! anything.
 
-use std::collections::HashMap;
-
 use base64::Engine;
+use serde::Deserialize;
 use serde_json::Value;
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
-const CONFIG_KEYS: [&str; 8] = [
+/// Every key this plugin reads out of its own config section.
+///
+/// Since the host began validating typed instance config, the guest no longer
+/// polices unknown keys: `additionalProperties = false` in `manifest.toml`
+/// rejects an undeclared key before the component starts. What this array is
+/// for now is the test that reads `manifest.toml` and asserts the schema
+/// declares exactly these keys, so a key added here and forgotten there fails
+/// the build rather than the operator's first run.
+pub const CONFIG_KEYS: [&str; 8] = [
     "stake_accounts",
     "authority",
     "rpc_url",
@@ -169,33 +176,78 @@ pub struct Config {
     pub timeout_secs: u64,
 }
 
-impl Config {
-    /// Parses the host-injected `__config` section. Fail-closed: any unknown
-    /// key is an error, so a typo surfaces immediately instead of silently
-    /// weakening an allowlist.
-    pub fn from_section(section: &HashMap<String, String>) -> Result<Self, String> {
-        for key in section.keys() {
-            if !CONFIG_KEYS.contains(&key.as_str()) {
-                return Err(format!(
-                    "unknown config key `{key}`; expected one of: {}",
-                    CONFIG_KEYS.join(", ")
-                ));
-            }
-        }
+/// The shape of this plugin's config section as the host now hands it over.
+///
+/// Since zeroclaw-labs/zeroclaw#9126 the host validates the operator's values
+/// against `[config_schema]` in `manifest.toml` and injects a *typed* JSON
+/// object, so the two allowlists arrive as arrays and the timeout as an
+/// integer, and there is no string splitting left for the guest to do.
+///
+/// Deliberately not `deny_unknown_fields`: `additionalProperties = false` in
+/// the manifest already refuses an undeclared key before the component starts,
+/// so guest-side strictness would add no protection and would turn a
+/// forward-compatible schema addition into a hard failure.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawConfig {
+    stake_accounts: Option<Vec<String>>,
+    authority: Option<String>,
+    rpc_url: Option<String>,
+    cluster: Option<String>,
+    allowed_vote_accounts: Option<Vec<String>>,
+    nonce_account: Option<String>,
+    nonce_authority: Option<String>,
+    timeout_secs: Option<u64>,
+}
 
-        let accounts = parse_accounts(section.get("stake_accounts").ok_or(
-            "config key `stake_accounts` is required: a comma-separated allowlist like `main:<pubkey>` or bare pubkeys",
+/// Describes a config deserialization failure without quoting the value that
+/// caused it.
+///
+/// `serde_json::Error`'s `Display` embeds the offending value. Every config
+/// value here is a pubkey or the operator's own RPC endpoint, which the host
+/// stores secret-marked and encrypted at rest, so echoing one into a
+/// `ToolResult` would hand it straight back to the model. This matters more in
+/// this plugin than in the two readers: the authority pubkey is the account a
+/// transaction built here would be signed by.
+fn describe_error(error: &serde_json::Error) -> String {
+    format!(
+        "config does not match the declared schema: {:?} error at line {} column {}",
+        error.classify(),
+        error.line(),
+        error.column()
+    )
+}
+
+impl Config {
+    /// Parses the typed `__config` object the host injects.
+    ///
+    /// The three keys this plugin cannot run without are `required` in the
+    /// schema, so a schema-enforcing host never reaches the missing-key
+    /// branches. They stay because host-side `cargo test` runs with no schema
+    /// validation at all, and because a builder without an authority has
+    /// nothing to name as the signer.
+    pub fn from_json(config: &Value) -> Result<Self, String> {
+        let raw: RawConfig = if config.is_null() {
+            RawConfig::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|error| describe_error(&error))?
+        };
+
+        let accounts = parse_accounts(raw.stake_accounts.as_deref().ok_or(
+            "config key `stake_accounts` is required: an allowlist array like [\"main:<pubkey>\"] or bare pubkeys",
         )?)?;
 
-        let authority = section
-            .get("authority")
+        let authority = raw
+            .authority
+            .as_deref()
             .ok_or("config key `authority` is required: the fee payer and stake authority pubkey (never a private key)")?
             .trim()
             .to_string();
         validate_pubkey(&authority, "config key `authority`")?;
 
-        let rpc_url = section
-            .get("rpc_url")
+        let rpc_url = raw
+            .rpc_url
+            .as_deref()
             .ok_or("config key `rpc_url` is required")?
             .trim()
             .trim_end_matches('/')
@@ -206,17 +258,17 @@ impl Config {
 
         // Unset means mainnet-beta: the default is the strictest reading of
         // an operator who never said which chain they meant.
-        let cluster = match section.get("cluster") {
-            Some(raw) => parse_cluster(raw)?,
+        let cluster = match raw.cluster.as_deref() {
+            Some(name) => parse_cluster(name)?,
             None => Cluster::MainnetBeta,
         };
 
-        let allowed_vote_accounts = match section.get("allowed_vote_accounts") {
-            Some(raw) => parse_vote_allowlist(raw)?,
+        let allowed_vote_accounts = match raw.allowed_vote_accounts.as_deref() {
+            Some(entries) => parse_vote_allowlist(entries)?,
             None => Vec::new(),
         };
 
-        let nonce = match (section.get("nonce_account"), section.get("nonce_authority")) {
+        let nonce = match (raw.nonce_account.as_deref(), raw.nonce_authority.as_deref()) {
             (None, None) => None,
             (Some(account), Some(authority)) => {
                 let account = account.trim().to_string();
@@ -233,13 +285,7 @@ impl Config {
             }
         };
 
-        let timeout_secs = match section.get("timeout_secs") {
-            Some(raw) => raw
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| format!("timeout_secs must be a positive integer, got `{raw}`"))?,
-            None => DEFAULT_TIMEOUT_SECS,
-        };
+        let timeout_secs = raw.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
         if timeout_secs == 0 || timeout_secs > 60 {
             return Err(format!(
                 "timeout_secs must be between 1 and 60, got {timeout_secs}"
@@ -278,11 +324,11 @@ impl Config {
     }
 }
 
-fn parse_accounts(raw: &str) -> Result<Vec<StakeAccountRef>, String> {
+fn parse_accounts(entries: &[String]) -> Result<Vec<StakeAccountRef>, String> {
     let mut out = Vec::new();
-    for (i, entry) in raw
-        .split(',')
-        .map(str::trim)
+    for (i, entry) in entries
+        .iter()
+        .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .enumerate()
     {
@@ -313,9 +359,9 @@ fn parse_accounts(raw: &str) -> Result<Vec<StakeAccountRef>, String> {
     Ok(out)
 }
 
-fn parse_vote_allowlist(raw: &str) -> Result<Vec<String>, String> {
+fn parse_vote_allowlist(entries: &[String]) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
-    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+    for entry in entries.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         validate_pubkey(entry, "allowed_vote_accounts entry")?;
         if out.iter().any(|v| v == entry) {
             return Err(format!(

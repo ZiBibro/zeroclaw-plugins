@@ -42,8 +42,13 @@ five to ten points between LTV and liquidation threshold and long-tail assets te
 to twenty. The report lists one line per position, worst risk first, and the
 whole thing is capped near 200 tokens so a recurring briefing never floods the
 agent context. Positions that the Kamino indexer has not refreshed against the
-current price feed carry a staleness hint, so an old snapshot is never presented
-as live.
+current price feed carry a staleness hint, so an old snapshot is not presented
+as live. Two limits on that marker, because a marker you trust needs its edges
+named: it stays silent below a six-hour skew, and it is derived from two
+timestamps in the Kamino response, so a reply that stops carrying either of them
+renders exactly like a fresh one. The MarginFi path has no equivalent marker at
+all; its figures come from a health cache the program writes on its own schedule
+and the account carries no age this reader surfaces.
 
 `UNKNOWN` covers the case where the source gave the tool nothing to measure
 against. MarginFi's risk engine zeroes the maintenance pair in its health cache
@@ -76,29 +81,49 @@ one and risk reporting a number that is simply wrong.
 
 ## Config keys
 
-The operator configures the plugin by name in `config.toml`; the host resolves
-that one section and hands the plugin a flat `string -> string` map, injected as
-`__config`. The plugin can never read the global config or another plugin's
-section.
+`manifest.toml` carries a closed Draft 2020-12 `config_schema` naming every key
+below. The host rejects a manifest that requests `config_read` without one, and
+it validates the operator's stored values against the schema before injecting
+them into `execute` arguments as a typed `__config` object. The plugin can never
+read the global config or another plugin's section.
 
-| Key | Default | Meaning |
-|---|---|---|
-| `wallets` | (required) | Comma-separated allowlist. Each entry is `label:pubkey` or a bare pubkey. The tool refuses to run with no wallet configured. |
-| `rpc_url` | (none) | Solana JSON-RPC endpoint used for the MarginFi read. Required whenever `marginfi` is enabled. Must be `https://`. |
-| `kamino_api_base` | `https://api.kamino.finance` | Base URL for the Kamino REST API. Must be `https://`. |
-| `protocols` | `kamino,marginfi` | Which protocols to query. |
-| `warn_liquidation_buffer` | `0.15` | Liquidation buffer at or below which a position is flagged `WARN`. |
-| `critical_liquidation_buffer` | `0.05` | Liquidation buffer at or below which a position is flagged `CRITICAL`. Must be below `warn_liquidation_buffer`: a warning fires while more of the buffer remains. |
-| `timeout_secs` | `10` | Per-request connect timeout in seconds, bounded to 1 through 60. |
+| Key | Schema type | Default | Meaning |
+|---|---|---|---|
+| `wallets` | `array` of `string` | (required) | Allowlist. Each entry is `label:pubkey` or a bare pubkey, which is then labelled by position. The tool refuses to run with no wallet configured. |
+| `rpc_url` | `string` | (none) | Solana JSON-RPC endpoint used for the MarginFi read. Required whenever `marginfi` is enabled. Must be `https://`. |
+| `kamino_api_base` | `string` | `https://api.kamino.finance` | Base URL for the Kamino REST API. Must be `https://`. |
+| `protocols` | `array` of `string` | `["kamino","marginfi"]` | Which protocols to query. |
+| `warn_liquidation_buffer` | `number` | `0.15` | Liquidation buffer at or below which a position is flagged `WARN`. |
+| `critical_liquidation_buffer` | `number` | `0.05` | Liquidation buffer at or below which a position is flagged `CRITICAL`. Must be below `warn_liquidation_buffer`: a warning fires while more of the buffer remains. |
+| `timeout_secs` | `integer` | `10` | Per-request connect timeout in seconds, bounded to 1 through 60. |
+
+Operator storage is still a string map, and the schema is what tells the host
+how to read each stored string. Set the two lists like this:
+
+```bash
+key=$(zeroclaw plugin info lending-health)   # prints the zpi1_... instance key
+zeroclaw config set "plugins.entries.$key.config.wallets" '["main:<pubkey>","cold:<pubkey>"]'
+zeroclaw config set "plugins.entries.$key.config.protocols" '["kamino"]'
+```
+
+**Breaking change in 0.2.0.** `wallets` and `protocols` were comma-separated
+strings before this release and are JSON arrays now. The host rejects the old
+encoding rather than reading it as one malformed entry, so an operator upgrading
+from 0.1.0 has to rewrite those two values. Nothing else in the config changes.
+The relation between the two thresholds is still checked in the plugin, because
+JSON Schema cannot state that one property must exceed another.
 
 Kamino and MarginFi measure LTV on different bases, and both land in the same
 column. Kamino publishes a protocol LTV: risk-adjusted debt over collateral,
 against a per-reserve liquidation threshold. MarginFi has no equivalent figure,
 so its ratio is maintenance-weighted liabilities over maintenance-weighted
 assets, liquidatable at 1.0, and its lines are prefixed `maint LTV`. The dollar
-amounts printed beside the ratio are unweighted for both protocols, so a MarginFi
-line can show $1,000 deposit, $700 borrow and `maint LTV 75.0%` without
-contradicting itself. The buffer normalizes the two bases, which is why one
+amounts printed beside the ratio are on a different basis from the ratio itself:
+Kamino's are its plain position values, and MarginFi's come from the health
+cache's initial-weight pair, which carries the program's own confidence and
+price discounts. So a MarginFi line can show $1,000 deposit, $700 borrow and
+`maint LTV 75.0%` without contradicting itself, because the ratio is
+maintenance-weighted and the amounts are not. The buffer normalizes the two bases, which is why one
 threshold pair governs both.
 
 ## Layout (the reference format)

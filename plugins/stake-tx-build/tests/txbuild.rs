@@ -1,16 +1,15 @@
-use std::collections::HashMap;
-
 use base64::Engine;
-use serde_json::Value;
+use serde_json::{json, Value};
 use stake_tx_build::txbuild::{
     build_transaction, compile_message, deactivate_instruction, decode_compact_u16, decode_pubkey,
     delegate_stake_instruction, encode_compact_u16, genesis_hash_body, latest_blockhash_body,
     nonce_account_body, parse_action, parse_genesis_hash, parse_latest_blockhash,
     parse_nonce_blockhash, parse_stake_standing, parse_voter_standing, serialize_message,
     serialize_transaction, stake_account_body, validate_vote, verify_cluster, vote_account_body,
-    Action, Cluster, Config, StakeAccountRef, StakeStanding, VoterStanding, DEVNET_GENESIS_HASH,
-    MAINNET_GENESIS_HASH, STAKE_CONFIG_ID, STAKE_PROGRAM_ID, SYSTEM_PROGRAM_ID, SYSVAR_CLOCK_ID,
-    SYSVAR_RECENT_BLOCKHASHES_ID, SYSVAR_STAKE_HISTORY_ID, TESTNET_GENESIS_HASH,
+    Action, Cluster, Config, StakeAccountRef, StakeStanding, VoterStanding, CONFIG_KEYS,
+    DEVNET_GENESIS_HASH, MAINNET_GENESIS_HASH, STAKE_CONFIG_ID, STAKE_PROGRAM_ID,
+    SYSTEM_PROGRAM_ID, SYSVAR_CLOCK_ID, SYSVAR_RECENT_BLOCKHASHES_ID, SYSVAR_STAKE_HISTORY_ID,
+    TESTNET_GENESIS_HASH,
 };
 
 /// Raw mainnet `getTransaction` reply for the delegate transaction at slot
@@ -27,31 +26,57 @@ const OTHER_VOTE: &str = "GHViLh5MgQDGDsuwXTHM9r8kQqEnQY6WsyLvGVYbFXAA";
 const NONCE_ACC: &str = "CEHKNKfqQhHDWgiPrLNut2K3o5izJ1gpfSZ42CWBAv5n";
 const BLOCKHASH: &str = "AbhvM59j2SQDA8VxhTUYbFfE6QHY4M6rx9FVypA5cN7X";
 
-fn section(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+/// The manifest is read as text rather than parsed, so these tests need no TOML
+/// dependency and still fail when the schema and the guest drift apart.
+const MANIFEST: &str = include_str!("../manifest.toml");
+
+/// The smallest working config, in the typed shape the host injects since it
+/// began validating against `[config_schema]`.
+fn config_json() -> Value {
+    json!({
+        "stake_accounts": [format!("main:{STAKE_ACC}")],
+        "authority": AUTHORITY,
+        "rpc_url": "https://example-rpc.test",
+        "allowed_vote_accounts": [VOTE_ACC],
+    })
 }
 
-fn base_section() -> HashMap<String, String> {
-    section(&[
-        ("stake_accounts", &format!("main:{STAKE_ACC}")[..]),
-        ("authority", AUTHORITY),
-        ("rpc_url", "https://example-rpc.test"),
-        ("allowed_vote_accounts", VOTE_ACC),
-    ])
+/// [`config_json`] with one key overridden.
+fn with(key: &str, value: Value) -> Value {
+    let mut cfg = config_json();
+    cfg[key] = value;
+    cfg
+}
+
+/// [`config_json`] with two keys overridden, for the nonce pair that has to be
+/// set together.
+fn with2(k1: &str, v1: Value, k2: &str, v2: Value) -> Value {
+    let mut cfg = config_json();
+    cfg[k1] = v1;
+    cfg[k2] = v2;
+    cfg
+}
+
+/// [`config_json`] with one key removed, for the tests that prove a default or
+/// a refusal when a key is absent.
+fn without(key: &str) -> Value {
+    let mut cfg = config_json();
+    cfg.as_object_mut().expect("object").remove(key);
+    cfg
 }
 
 fn base_config() -> Config {
-    Config::from_section(&base_section()).expect("base config")
+    Config::from_json(&config_json()).expect("base config")
 }
 
 fn durable_config() -> Config {
-    let mut s = base_section();
-    s.insert("nonce_account".to_string(), NONCE_ACC.to_string());
-    s.insert("nonce_authority".to_string(), AUTHORITY.to_string());
-    Config::from_section(&s).expect("durable nonce config")
+    Config::from_json(&with2(
+        "nonce_account",
+        json!(NONCE_ACC),
+        "nonce_authority",
+        json!(AUTHORITY),
+    ))
+    .expect("durable nonce config")
 }
 
 fn blockhash_bytes() -> [u8; 32] {
@@ -73,60 +98,133 @@ fn config_parses_valid_section() {
 }
 
 #[test]
-fn config_rejects_unknown_key() {
-    let mut s = base_section();
-    s.insert("stake_acounts".to_string(), "x".to_string());
-    let err = Config::from_section(&s).unwrap_err();
+fn manifest_pairs_config_read_with_config_schema() {
+    // The host treats the two as a biconditional and refuses to discover a
+    // package that declares one without the other, so this is the cheapest
+    // possible guard against shipping an uninstallable manifest.
     assert!(
-        err.contains("unknown config key `stake_acounts`"),
+        MANIFEST.contains("\"config_read\""),
+        "manifest no longer requests config_read"
+    );
+    assert!(
+        MANIFEST.contains("[config_schema]"),
+        "manifest requests config_read without declaring config_schema"
+    );
+    assert!(
+        MANIFEST.contains("additionalProperties = false"),
+        "config_schema must be closed for the config_read grant to be enumerable"
+    );
+}
+
+#[test]
+fn manifest_schema_declares_every_config_key() {
+    // The guest no longer rejects unknown keys itself: additionalProperties =
+    // false does that before the component starts. This is what replaces the
+    // old unknown-key test. A key read by the guest but missing from the
+    // schema would be stripped by the host and silently default, which in this
+    // plugin could mean an allowlist that quietly disappears.
+    assert!(!CONFIG_KEYS.is_empty(), "the key list must not be empty");
+    for key in CONFIG_KEYS {
+        let declaration = format!("[config_schema.properties.{key}]");
+        assert!(
+            MANIFEST.contains(&declaration),
+            "config key `{key}` is read by the guest but absent from config_schema"
+        );
+    }
+}
+
+#[test]
+fn config_accepts_typed_arrays_and_integers() {
+    // The two allowlists arrive as real arrays now, and the timeout as a real
+    // integer. Before 0.2.0 all three were strings the guest parsed itself.
+    let cfg = Config::from_json(&json!({
+        "stake_accounts": [format!("main:{STAKE_ACC}"), NONCE_ACC],
+        "authority": AUTHORITY,
+        "rpc_url": "https://example-rpc.test",
+        "allowed_vote_accounts": [VOTE_ACC, OTHER_VOTE],
+        "timeout_secs": 30,
+    }))
+    .expect("typed config");
+    assert_eq!(cfg.accounts.len(), 2);
+    assert_eq!(cfg.accounts[1].label, "stake2");
+    assert_eq!(cfg.allowed_vote_accounts.len(), 2);
+    assert_eq!(cfg.timeout_secs, 30);
+}
+
+#[test]
+fn config_rejects_the_pre_0_2_0_comma_separated_encoding() {
+    // The old operator value was one comma-separated string for each of the
+    // two allowlists. Splitting them here would resurrect the untyped path the
+    // host removed, and for an allowlist that is a security boundary rather
+    // than a convenience.
+    for key in ["stake_accounts", "allowed_vote_accounts"] {
+        let err =
+            Config::from_json(&with(key, json!(format!("{VOTE_ACC},{OTHER_VOTE}")))).unwrap_err();
+        assert!(
+            err.contains("does not match the declared schema"),
+            "{key} gave: {err}"
+        );
+    }
+}
+
+#[test]
+fn config_error_does_not_echo_the_offending_value() {
+    // Every config value here is a pubkey or the operator's RPC endpoint, all
+    // secret-marked by the host. The authority in particular names the account
+    // a built transaction would be signed by, so it must never travel back to
+    // the model inside an error.
+    let err = Config::from_json(&with("authority", json!([AUTHORITY]))).unwrap_err();
+    assert!(!err.contains(AUTHORITY), "err leaked the authority: {err}");
+    assert!(
+        err.contains("does not match the declared schema"),
         "err: {err}"
     );
 }
 
 #[test]
 fn config_requires_authority() {
-    let mut s = base_section();
-    s.remove("authority");
-    let err = Config::from_section(&s).unwrap_err();
+    let err = Config::from_json(&without("authority")).unwrap_err();
     assert!(err.contains("`authority` is required"), "err: {err}");
 }
 
 #[test]
+fn config_null_fails_closed_on_the_required_allowlist() {
+    // A withheld config_read grant injects an empty object, and a host that
+    // injects nothing at all sends null. Neither may start a transaction
+    // builder with no allowlist and no authority.
+    for empty in [Value::Null, json!({})] {
+        let err = Config::from_json(&empty).unwrap_err();
+        assert!(err.contains("`stake_accounts` is required"), "err: {err}");
+    }
+}
+
+#[test]
 fn config_rejects_http_url() {
-    let mut s = base_section();
-    s.insert("rpc_url".to_string(), "http://insecure.test".to_string());
-    assert!(Config::from_section(&s).is_err());
+    assert!(Config::from_json(&with("rpc_url", json!("http://insecure.test"))).is_err());
 }
 
 #[test]
 fn config_rejects_half_a_nonce_pair() {
-    let mut s = base_section();
-    s.insert("nonce_account".to_string(), NONCE_ACC.to_string());
-    let err = Config::from_section(&s).unwrap_err();
-    assert!(err.contains("must be set together"), "err: {err}");
-
-    let mut s = base_section();
-    s.insert("nonce_authority".to_string(), AUTHORITY.to_string());
-    let err = Config::from_section(&s).unwrap_err();
-    assert!(err.contains("must be set together"), "err: {err}");
+    // JSON Schema cannot state that two sibling properties must appear
+    // together, so this relation is the guest's to hold.
+    for key in ["nonce_account", "nonce_authority"] {
+        let err = Config::from_json(&with(key, json!(NONCE_ACC))).unwrap_err();
+        assert!(err.contains("must be set together"), "{key} gave: {err}");
+    }
 }
 
 #[test]
 fn config_rejects_bad_vote_pubkey() {
-    let mut s = base_section();
-    s.insert(
-        "allowed_vote_accounts".to_string(),
-        "notbase58!".to_string(),
-    );
-    assert!(Config::from_section(&s).is_err());
+    assert!(Config::from_json(&with("allowed_vote_accounts", json!(["notbase58!"]))).is_err());
 }
 
 #[test]
 fn config_rejects_out_of_range_timeout() {
-    for bad in ["0", "61"] {
-        let mut s = base_section();
-        s.insert("timeout_secs".to_string(), bad.to_string());
-        assert!(Config::from_section(&s).is_err(), "timeout {bad} must fail");
+    for bad in [json!(0), json!(61)] {
+        assert!(
+            Config::from_json(&with("timeout_secs", bad.clone())).is_err(),
+            "timeout {bad} must fail"
+        );
     }
 }
 
@@ -146,9 +244,8 @@ fn config_parses_every_named_cluster() {
         ("testnet", Cluster::Testnet, TESTNET_GENESIS_HASH),
     ];
     for (name, expected, genesis) in cases {
-        let mut s = base_section();
-        s.insert("cluster".to_string(), name.to_string());
-        let cfg = Config::from_section(&s).unwrap_or_else(|e| panic!("cluster {name}: {e}"));
+        let cfg = Config::from_json(&with("cluster", json!(name)))
+            .unwrap_or_else(|e| panic!("cluster {name}: {e}"));
         assert_eq!(cfg.cluster, expected);
         assert_eq!(cfg.cluster.genesis_hash(), genesis);
         assert_eq!(cfg.cluster.as_str(), name);
@@ -160,9 +257,7 @@ fn config_rejects_unknown_cluster_value() {
     // Near misses included: an abbreviation and a case variant must fail
     // closed rather than resolve to mainnet.
     for bad in ["mainnet", "Mainnet-Beta", "localnet", ""] {
-        let mut s = base_section();
-        s.insert("cluster".to_string(), bad.to_string());
-        let err = Config::from_section(&s).unwrap_err();
+        let err = Config::from_json(&with("cluster", json!(bad))).unwrap_err();
         assert!(
             err.contains("cluster must be one of") && err.contains("mainnet-beta"),
             "cluster `{bad}` err: {err}"
@@ -212,9 +307,8 @@ fn vote_outside_allowlist_is_refused() {
 
 #[test]
 fn delegate_without_vote_allowlist_is_disabled() {
-    let mut s = base_section();
-    s.remove("allowed_vote_accounts");
-    let cfg = Config::from_section(&s).expect("config without a vote allowlist");
+    let cfg = Config::from_json(&without("allowed_vote_accounts"))
+        .expect("config without a vote allowlist");
     let err = validate_vote(&cfg, Action::Delegate, Some(VOTE_ACC)).unwrap_err();
     assert!(err.contains("delegate is disabled"), "err: {err}");
 }
@@ -650,6 +744,22 @@ fn deactivate_builds_expected_wire_transaction() {
         .expect("base64 output");
     let tx = decode_tx(&bytes);
 
+    // The worked example in this plugin's README quotes this transaction elided.
+    // It used to quote a tail hand-assembled from the instruction bytes, which
+    // the encoder cannot produce, so the head, the tail and the length are
+    // pinned here against the README.
+    assert_eq!(built.tx_base64.len(), 320);
+    assert!(
+        built.tx_base64.starts_with("AQAAAAAAAAAAAAAAAAAAAAAA"),
+        "README head drifted: {}",
+        built.tx_base64
+    );
+    assert!(
+        built.tx_base64.ends_with("hgEDAwECAAQFAAAA"),
+        "README tail drifted: {}",
+        built.tx_base64
+    );
+
     // Unsigned form: the signature count equals numRequiredSignatures and
     // every slot is a 64-byte zero placeholder.
     assert_eq!(tx.signature_count, 1);
@@ -967,12 +1077,15 @@ fn the_summary_names_the_addresses_that_are_actually_signed() {
 /// key they may not hold.
 #[test]
 fn a_separate_nonce_authority_is_named_as_a_second_signer() {
-    let mut s = base_section();
-    s.insert("nonce_account".to_string(), NONCE_ACC.to_string());
     // The stake account doubles as a stand-in for a nonce authority held apart
     // from the fee payer; only its distinctness from AUTHORITY matters here.
-    s.insert("nonce_authority".to_string(), STAKE_ACC.to_string());
-    let cfg = Config::from_section(&s).expect("split-authority nonce config");
+    let cfg = Config::from_json(&with2(
+        "nonce_account",
+        json!(NONCE_ACC),
+        "nonce_authority",
+        json!(STAKE_ACC),
+    ))
+    .expect("split-authority nonce config");
     let stake = cfg.resolve_stake("main").unwrap();
     let built = build_transaction(
         &cfg,
@@ -1045,12 +1158,14 @@ fn a_shared_nonce_authority_still_reads_as_a_sole_signer() {
 /// ambiguity is refused when the config is parsed.
 #[test]
 fn a_label_that_is_itself_a_pubkey_is_refused() {
-    let mut s = base_section();
-    s.insert(
-        "stake_accounts".to_string(),
-        format!("{VOTE_ACC}:{STAKE_ACC},main:{VOTE_ACC}"),
-    );
-    let err = Config::from_section(&s).unwrap_err();
+    let err = Config::from_json(&with(
+        "stake_accounts",
+        json!([
+            format!("{VOTE_ACC}:{STAKE_ACC}"),
+            format!("main:{VOTE_ACC}")
+        ]),
+    ))
+    .unwrap_err();
     assert!(err.contains("is itself a valid pubkey"), "err: {err}");
 }
 
@@ -1066,12 +1181,11 @@ fn an_invisible_character_is_named_rather_than_silently_mismatched() {
 
     // Worst case: the invisible byte sits in the config, where the label could
     // never be typed to match and the plugin would be stuck for good.
-    let mut s = base_section();
-    s.insert(
-        "stake_accounts".to_string(),
-        format!("ma\u{200b}in:{STAKE_ACC}"),
-    );
-    let err = Config::from_section(&s).unwrap_err();
+    let err = Config::from_json(&with(
+        "stake_accounts",
+        json!([format!("ma\u{200b}in:{STAKE_ACC}")]),
+    ))
+    .unwrap_err();
     assert!(err.contains("invisible character"), "err: {err}");
 }
 
@@ -1080,18 +1194,11 @@ fn an_invisible_character_is_named_rather_than_silently_mismatched() {
 /// broken.
 #[test]
 fn a_broken_pubkey_names_the_config_key_it_came_from() {
-    let mut s = base_section();
-    s.insert("authority".to_string(), String::new());
-    let err = Config::from_section(&s).unwrap_err();
+    let err = Config::from_json(&with("authority", json!(""))).unwrap_err();
     assert!(err.contains("config key `authority`"), "err: {err}");
     assert!(err.contains("empty"), "err: {err}");
 
-    let mut s = base_section();
-    s.insert(
-        "allowed_vote_accounts".to_string(),
-        "notbase58!".to_string(),
-    );
-    let err = Config::from_section(&s).unwrap_err();
+    let err = Config::from_json(&with("allowed_vote_accounts", json!(["notbase58!"]))).unwrap_err();
     assert!(err.contains("allowed_vote_accounts entry"), "err: {err}");
 }
 

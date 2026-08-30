@@ -33,26 +33,49 @@ transaction draws its blockhash from the nonce account state, so it does not go
 stale while it waits in an approval queue. Without a nonce the tool reads a
 fresh blockhash and the summary warns that the signing window is short.
 
-The builder runs no live validator health check before it delegates, and that
-gap is deliberate. Target safety is enforced by the vote account allowlist, and
-live health belongs to the separate `stake-monitor` tool.
+Before a delegate the builder does read the target validator's live standing,
+with `getVoteAccounts` filtered to that vote account, and it names a delinquent
+or absent target in the pre-signing summary. It warns rather than refuses, and
+that is deliberate: enforcement belongs to the vote account allowlist, and an
+operator delegating to a validator they know is coming back would otherwise be
+stranded with no override.
 
 ## Config keys
 
-The operator configures the plugin by name; the host resolves that one section
-and hands the plugin a flat `string -> string` map, injected as `__config`. This
-only happens because the manifest requests the `config_read` permission.
+`manifest.toml` carries a closed Draft 2020-12 `config_schema` naming every key
+below. The host rejects a manifest that requests `config_read` without one, and
+it validates the operator's stored values against the schema before injecting
+them into `execute` arguments as a typed `__config` object.
 
-| Key | Default | Meaning |
-|---|---|---|
-| `stake_accounts` | (required) | Comma-separated allowlist. Each entry is `label:pubkey` or a bare pubkey. The only stake accounts the tool will act on. |
-| `authority` | (required) | Fee payer and stake authority **public key**. Never a private key. |
-| `rpc_url` | (required) | HTTPS Solana RPC endpoint read for a blockhash. Must start with `https://`. |
-| `cluster` | `mainnet-beta` | Cluster the endpoint's reported genesis hash must match. Stays on `mainnet-beta` unless the operator names another public cluster; the alternatives are `devnet` and `testnet`. Any other value is rejected. |
-| `allowed_vote_accounts` | (empty) | Comma-separated allowlist of vote accounts eligible as delegation targets. Empty disables `delegate` entirely. |
-| `nonce_account` | (unset) | Durable nonce account pubkey. Set with `nonce_authority` to build a transaction that survives an approval queue. |
-| `nonce_authority` | (unset) | Authority pubkey for the durable nonce. Must be set together with `nonce_account`. |
-| `timeout_secs` | `10` | Connect timeout for the RPC call, between 1 and 60. |
+| Key | Schema type | Default | Meaning |
+|---|---|---|---|
+| `stake_accounts` | `array` of `string` | (required) | Allowlist. Each entry is `label:pubkey` or a bare pubkey. The only stake accounts the tool will act on. |
+| `authority` | `string` | (required) | Fee payer and stake authority **public key**. Never a private key. |
+| `rpc_url` | `string` | (required) | HTTPS Solana RPC endpoint read for a blockhash. Must start with `https://`. |
+| `cluster` | `string` enum | `mainnet-beta` | Cluster the endpoint's reported genesis hash must match. Stays on `mainnet-beta` unless the operator names another public cluster; the alternatives are `devnet` and `testnet`. Any other value is rejected. |
+| `allowed_vote_accounts` | `array` of `string` | (empty) | Allowlist of vote accounts eligible as delegation targets. Empty disables `delegate` entirely. |
+| `nonce_account` | `string` | (unset) | Durable nonce account pubkey. Set with `nonce_authority` to build a transaction that survives an approval queue. |
+| `nonce_authority` | `string` | (unset) | Authority pubkey for the durable nonce. Must be set together with `nonce_account`. |
+| `timeout_secs` | `integer` | `10` | Connect timeout for the RPC call, between 1 and 60. |
+
+Operator storage is still a string map, and the schema is what tells the host
+how to read each stored string. Set the two allowlists like this:
+
+```bash
+key=$(zeroclaw plugin info stake-tx-build)   # prints the zpi1_... instance key
+zeroclaw config set "plugins.entries.$key.config.stake_accounts" '["main:<pubkey>"]'
+zeroclaw config set "plugins.entries.$key.config.allowed_vote_accounts" '["<vote pubkey>"]'
+```
+
+**Breaking change in 0.2.0.** `stake_accounts` and `allowed_vote_accounts` were
+comma-separated strings before this release and are JSON arrays now, and
+`timeout_secs` is a real integer. The host rejects the old encoding rather than
+reading it as one malformed entry, which matters more here than in the two
+readers: both of these lists are security boundaries rather than conveniences,
+and a silently misread allowlist is the failure this design exists to prevent.
+Two relations stay in the plugin because JSON Schema cannot state them between
+sibling properties: the nonce pair must be set together or not at all, and the
+endpoint's genesis hash must match the pinned cluster.
 
 Upgrading from a version without the cluster gate: `cluster` now defaults to
 `mainnet-beta`, so a config whose `rpc_url` points at devnet or testnet fails
@@ -92,9 +115,10 @@ no `sendTransaction` path, so what it returns stays inert until a human signs it
 in a wallet the plugin never sees.
 
 This tool builds unsigned transactions and holds no keys. Its only outbound
-calls are reads against the operator's own RPC endpoint: the cluster genesis
-hash, then a blockhash or the nonce account state. Everything it produces is
-inert until a human signs it in a wallet the plugin never sees.
+calls are three reads against the operator's own RPC endpoint: the cluster
+genesis hash, then a blockhash or the nonce account state, then the live
+standing of the account it is about to touch. Everything it produces is inert
+until a human signs it in a wallet the plugin never sees.
 
 The manifest asks for exactly two permissions: `http_client` for those RPC
 reads and `config_read` for its own jailed config section. Neither one can sign
@@ -185,7 +209,7 @@ nonce configured, returns:
 
 ```
 Unsigned deactivate transaction. Verify each address below in full before signing, and do not abbreviate them when relaying: a shortened address can be ground to match on its visible ends. Stake account CUupRKBoZ3WvHV24uBtCMXz3ms2geTad7g1k2ZpyqPmq (config label `main`), fee payer and sole signer AAJNL7uZrwcCFPAFJHRiSDEKXGgdZXhpL427iqkDFnre; lifetime: fresh blockhash, sign and submit within roughly 60 to 90 seconds; amount: not read by this builder.
-unsigned_tx_base64: AQAAAA...BAUAAAA
+unsigned_tx_base64: AQAAAAAAAAAAAAAAAAAAAAAA...hgEDAwECAAQFAAAA   (320 characters)
 ```
 
 Decoded byte for byte, the deactivation instruction verifies against the Stake
@@ -212,7 +236,7 @@ approved validators:
 
 ```
 success=false
-error: vote account `5btPEka74QyPuY7Yj6wks8oHHLFMqHWFiRraSLzUB5Ev` is not in the configured allowed_vote_accounts allowlist
+error: vote account `5btPEka74QyPuY7Yj6wks8oHHLFMqHWFiRraSLzUB5Ev` is not in the configured allowed_vote_accounts allowlist (a comma-separated string of vote account pubkeys, not a TOML array)
 ```
 
 The `deactivate`, naming a stake account the config never mentions:
@@ -260,9 +284,10 @@ to rediscover.
 **Getting the transaction out of the channel intact.** The host scans outbound
 channel messages for leaked credentials and replaces high-entropy tokens with
 `[REDACTED_HIGH_ENTROPY_TOKEN]`. A base64 transaction trips that heuristic. The
-deactivate transaction measured here was 169 characters with a Shannon entropy
-of 5.57, against a default threshold of 4.375, so the operator receives a
-placeholder where the transaction should be. Set
+deactivate transaction measured here was 320 characters with a Shannon entropy
+of 4.79, and the durable-nonce variant 464 characters at 4.74, against a default
+threshold of 4.375, so the operator receives a placeholder where the transaction
+should be. Set
 
 ```toml
 [security.leak_detection]
