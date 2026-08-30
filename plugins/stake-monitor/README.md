@@ -234,7 +234,7 @@ which is the section the `config_read` permission unlocks:
 name = "stake-monitor"
 
 [plugins.entries.config]
-stake_accounts = "main:6ySLTQWEpCFKPYKfPaKYnhKzEccuqKafFEzfJVQ4Gifp"
+stake_accounts = '["main:6ySLTQWEpCFKPYKfPaKYnhKzEccuqKafFEzfJVQ4Gifp"]'
 rpc_url = "https://your-own-rpc.example.com"
 vote_lag_warn_slots = "32"
 timeout_secs = "10"
