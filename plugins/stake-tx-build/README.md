@@ -90,14 +90,6 @@ additionally requires a `vote_account`, which must appear in
 ## Layout (the reference format)
 
 ```
-
-**`config set` will not take these values on the command line.** The host treats
-every key under `plugins.entries.*.config.*` as an encrypted secret, so it ignores
-the value you pass and prompts for masked input instead; outside a terminal it
-refuses outright with `Secret input requires a terminal on stdin and stderr`. Run
-the commands above interactively and paste each value at the prompt, or write the
-block straight into `config.toml` as shown below, which is what the installer
-seeds and what a scripted setup should do.
 src/txbuild.rs   # pure logic, no wasm deps; host-testable with cargo test
 src/lib.rs       # thin #[cfg(target_family = "wasm")] component shim
 tests/           # host-run integration tests over the pure core
@@ -275,7 +267,48 @@ configured plugins dir, then enable plugins and configure the keys above:
 ```toml
 [plugins]
 enabled = true
+# REQUIRED on every host newer than the pinned `fc8b4d83`, including 0.8.4 and
+# current master: this is the only gate that admits Tool and Skill plugins, and
+# it defaults to false. Without it the daemon starts clean and registers nothing.
+# Inert at the pinned host, so it is safe to set either way.
+auto_discover = true
 ```
+
+
+Configuration is required here, since the plugin refuses to run without an
+allowlist. Supply it in the plugin's own config record, which is the section the
+`config_read` permission unlocks:
+
+```toml
+[[plugins.entries]]
+# The INSTANCE KEY that `zeroclaw plugin info stake-tx-build` prints on its
+# `Config entry key` line, not the package name: the host consults entries by
+# that key and silently ignores an entry named after the package.
+name = "zpi1_WyJzdGFrZS10eC1idWlsZCIsInRvb2wiLCJzdGFrZS10eC1idWlsZCJd"
+
+[plugins.entries.config]
+# Every value is a string. Non-string properties must CONTAIN valid JSON, so a
+# list is a quoted string holding a JSON array. A bare TOML number or a
+# comma-separated list is refused.
+stake_accounts = '["main:REPLACE_WITH_YOUR_STAKE_ACCOUNT_PUBKEY"]'
+# The fee payer and stake authority PUBLIC key. Never a private key.
+authority = "REPLACE_WITH_YOUR_STAKE_AUTHORITY_PUBKEY"
+rpc_url = "https://REPLACE_WITH_YOUR_RPC_ENDPOINT"
+# The plugin reads the endpoint's genesis hash and refuses to build if it does
+# not match this. Change to "devnet" if your rpc_url is a devnet endpoint.
+cluster = "mainnet-beta"
+# Empty disables the delegate action entirely. Opt in by listing vote accounts.
+allowed_vote_accounts = '[]'
+timeout_secs = "10"
+```
+
+**`config set` will not take these values on the command line.** The host treats
+every key under `plugins.entries.*.config.*` as an encrypted secret, so it ignores
+the value you pass and prompts for masked input instead; outside a terminal it
+refuses outright with `Secret input requires a terminal on stdin and stderr`. Run
+`config set` interactively and paste each value at the prompt, or write the block
+above straight into `config.toml`, which is what the installer seeds and what a
+scripted setup should do.
 
 Run the agent with a build that includes a compiler backend, e.g.
 `--features plugins-wasm,plugins-wasm-cranelift`. For runtime-only hosts

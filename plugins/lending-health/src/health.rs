@@ -440,7 +440,7 @@ impl Risk {
 /// Risk for one measured position, judged against the liquidation line that
 /// position actually carries rather than against a flat pair of numbers. Kamino
 /// reports a different `liquidationLtv` per market and per obligation, so the
-/// same 82% LTV is comfortable at a 95% line and past saving at an 80% one.
+/// same 82% LTV is a warning at a 95% line and past saving at an 80% one.
 ///
 /// A position at or beyond its own line is [`Risk::Critical`] whatever the
 /// thresholds say: the protocol can seize it now. A line of zero or a

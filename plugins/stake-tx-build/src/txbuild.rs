@@ -486,7 +486,7 @@ pub fn validate_vote(
                 .to_string();
             if cfg.allowed_vote_accounts.is_empty() {
                 return Err(
-                    "delegate is disabled: config key `allowed_vote_accounts` is not set"
+                    "delegate is disabled: config key `allowed_vote_accounts` is empty or unset; list at least one vote account to enable it"
                         .to_string(),
                 );
             }
