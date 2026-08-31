@@ -90,6 +90,14 @@ additionally requires a `vote_account`, which must appear in
 ## Layout (the reference format)
 
 ```
+
+**`config set` will not take these values on the command line.** The host treats
+every key under `plugins.entries.*.config.*` as an encrypted secret, so it ignores
+the value you pass and prompts for masked input instead; outside a terminal it
+refuses outright with `Secret input requires a terminal on stdin and stderr`. Run
+the commands above interactively and paste each value at the prompt, or write the
+block straight into `config.toml` as shown below, which is what the installer
+seeds and what a scripted setup should do.
 src/txbuild.rs   # pure logic, no wasm deps; host-testable with cargo test
 src/lib.rs       # thin #[cfg(target_family = "wasm")] component shim
 tests/           # host-run integration tests over the pure core

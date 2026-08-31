@@ -129,6 +129,14 @@ threshold pair governs both.
 ## Layout (the reference format)
 
 ```
+
+**`config set` will not take these values on the command line.** The host treats
+every key under `plugins.entries.*.config.*` as an encrypted secret, so it ignores
+the value you pass and prompts for masked input instead; outside a terminal it
+refuses outright with `Secret input requires a terminal on stdin and stderr`. Run
+the commands above interactively and paste each value at the prompt, or write the
+block straight into `config.toml` as shown below, which is what the installer
+seeds and what a scripted setup should do.
 src/health.rs     # pure core: config parsing, request planning, risk classification, report rendering
 src/kamino.rs     # Kamino REST path: URL building and portfolio parsing
 src/marginfi.rs   # MarginFi path: getProgramAccounts body and raw account decoding

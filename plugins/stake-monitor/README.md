@@ -149,6 +149,14 @@ rewrite the allowlist value.
 An active account whose validator has started to drift:
 
 ```
+
+**`config set` will not take these values on the command line.** The host treats
+every key under `plugins.entries.*.config.*` as an encrypted secret, so it ignores
+the value you pass and prompts for masked input instead; outside a terminal it
+refuses outright with `Secret input requires a terminal on stdin and stderr`. Run
+the commands above interactively and paste each value at the prompt, or write the
+block straight into `config.toml` as shown below, which is what the installer
+seeds and what a scripted setup should do.
 Stake: 1 account(s), 500 SOL delegated, epoch 1004 at 45% (~26 h left). 1 validator(s) BEHIND.
 [active] main: 500 SOL, validator GHVi.. ok, vote lag 67 slot(s) BEHIND, fee 100.0%, no reward last epoch
 ```
